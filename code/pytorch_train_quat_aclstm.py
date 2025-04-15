@@ -101,10 +101,17 @@ class acLSTM(nn.Module):
     #cuda tensor out_seq batch*(seq_len*frame_size)
     #cuda tensor groundtruth_seq batch*(seq_len*frame_size)
     def calculate_loss(self, out_seq, groundtruth_seq):
+        B, D = out_seq.shape  # batch, total_dim
+        num_joints = D // 4
+        pred = out_seq.view(B, num_joints, 4)
+        target = groundtruth_seq.view(B, num_joints, 4)
 
-        loss_function = nn.MSELoss()
-        loss = loss_function(out_seq, groundtruth_seq)
-        return loss
+        pred = torch.nn.functional.normalize(pred, dim=-1)
+        target = torch.nn.functional.normalize(target, dim=-1)
+        dot = torch.sum(pred * target, dim=-1)
+        loss = 1.0 - dot ** 2  # use squared cosine similarity
+        return loss.mean()
+
 
 
 #numpy array real_seq_np: batch*seq_len*frame_size

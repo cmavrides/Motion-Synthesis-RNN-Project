@@ -101,10 +101,11 @@ class acLSTM(nn.Module):
     #cuda tensor out_seq batch*(seq_len*frame_size)
     #cuda tensor groundtruth_seq batch*(seq_len*frame_size)
     def calculate_loss(self, out_seq, groundtruth_seq):
+    # Regularize angles to avoid wraparound issues
+        diff = out_seq - groundtruth_seq
+        diff = (diff + 180.0) % 360.0 - 180.0
+        return torch.nn.functional.smooth_l1_loss(diff, torch.zeros_like(diff))
 
-        loss_function = nn.MSELoss()
-        loss = loss_function(out_seq, groundtruth_seq)
-        return loss
 
 
 #numpy array real_seq_np: batch*seq_len*frame_size
