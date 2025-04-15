@@ -237,7 +237,8 @@ def train(dances, frame_rate, batch, seq_len, read_weight_path, write_weight_fol
             dance=dances[dance_id].copy()
             dance_len = dance.shape[0]
 
-            start_id=random.randint(10, dance_len-seq_len*speed-10)#the first and last several frames are sometimes noisy.
+# Line 240 in the train function:
+            start_id = random.randint(10, int(dance_len-seq_len*speed-10))
             sample_seq=[]
             for i in range(seq_len):
                 sample_seq=sample_seq+[dance[int(i*speed+start_id)]]
