@@ -40,9 +40,9 @@ skeleton, non_end_bones = read_bvh.read_bvh_hierarchy.read_bvh_hierarchy(standar
 
 print('skeleton: ', skeleton)
 
-bvh_dir_path = r"C:\Users\alexa\OneDrive - University of Cyprus\Masters in Artificial Intelligence\2nd semester\ML For Graphics - 645\FINAL PROJECT\MAI645_Team_04\train_data_bvh"
-euler_enc_dir_path = r"train_data_euler"
-bvh_reconstructed_dir_path = r"reconstructed_euler_bvh"
+bvh_dir_path = r"C:\Users\alexa\OneDrive - University of Cyprus\Masters in Artificial Intelligence\2nd semester\ML For Graphics - 645\FINAL PROJECT\MAI645_Team_04\train_data_bvh\martial"
+euler_enc_dir_path = r"train_data_euler\martial"
+bvh_reconstructed_dir_path = r"reconstructed_euler_bvh\martial"
 
 #comment the following to run test_generate_data.py
 # Encode data from bvh to positional encoding
@@ -50,3 +50,27 @@ generate_euler_traindata_from_bvh(bvh_dir_path, euler_enc_dir_path)
 
 # Decode from positional to bvh
 generate_bvh_from_euler_traindata(euler_enc_dir_path, bvh_reconstructed_dir_path)
+
+bvh_dir_path = r"C:\Users\alexa\OneDrive - University of Cyprus\Masters in Artificial Intelligence\2nd semester\ML For Graphics - 645\FINAL PROJECT\MAI645_Team_04\train_data_bvh\salsa"
+euler_enc_dir_path = r"train_data_euler\salsa"
+bvh_reconstructed_dir_path = r"reconstructed_euler_bvh\salsa"
+
+#comment the following to run test_generate_data.py
+# Encode data from bvh to positional encoding
+generate_euler_traindata_from_bvh(bvh_dir_path, euler_enc_dir_path)
+
+# Decode from positional to bvh
+generate_bvh_from_euler_traindata(euler_enc_dir_path, bvh_reconstructed_dir_path)
+
+bvh_dir_path = r"C:\Users\alexa\OneDrive - University of Cyprus\Masters in Artificial Intelligence\2nd semester\ML For Graphics - 645\FINAL PROJECT\MAI645_Team_04\train_data_bvh\indian"
+euler_enc_dir_path = r"train_data_euler\indian"
+bvh_reconstructed_dir_path = r"reconstructed_euler_bvh\indian"
+
+#comment the following to run test_generate_data.py
+# Encode data from bvh to positional encoding
+generate_euler_traindata_from_bvh(bvh_dir_path, euler_enc_dir_path)
+
+# Decode from positional to bvh
+generate_bvh_from_euler_traindata(euler_enc_dir_path, bvh_reconstructed_dir_path)
+
+

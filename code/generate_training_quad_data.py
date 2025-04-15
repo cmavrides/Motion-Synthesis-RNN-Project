@@ -88,14 +88,41 @@ def generate_bvh_from_quad_traindata(src_train_folder, tar_bvh_folder):
             print(f"Check decode_helpers.py for expected number of joints")
 
 
-bvh_dir_path = r"C:\Users\alexa\OneDrive - University of Cyprus\Masters in Artificial Intelligence\2nd semester\ML For Graphics - 645\FINAL PROJECT\MAI645_Team_04\train_data_bvh"
-quad_enc_dir_path = r"train_data_quad"
-bvh_reconstructed_dir_path = r"reconstructed_quad_bvh"
+bvh_dir_path = r"C:\Users\alexa\OneDrive - University of Cyprus\Masters in Artificial Intelligence\2nd semester\ML For Graphics - 645\FINAL PROJECT\MAI645_Team_04\train_data_bvh\indian"
+quad_enc_dir_path = r"train_data_quad\indian"
+bvh_reconstructed_dir_path = r"reconstructed_quad_bvh\indian"
 
 
 #comment the following to run test_generate_data.py
 # Encode data from bvh to positional encoding
-#generate_quad_traindata_from_bvh(bvh_dir_path, quad_enc_dir_path)
+generate_quad_traindata_from_bvh(bvh_dir_path, quad_enc_dir_path)
 
 # Decode from positional to bvh
-#generate_bvh_from_quad_traindata(quad_enc_dir_path, bvh_reconstructed_dir_path)
+generate_bvh_from_quad_traindata(quad_enc_dir_path, bvh_reconstructed_dir_path)
+
+
+
+bvh_dir_path = r"C:\Users\alexa\OneDrive - University of Cyprus\Masters in Artificial Intelligence\2nd semester\ML For Graphics - 645\FINAL PROJECT\MAI645_Team_04\train_data_bvh\salsa"
+quad_enc_dir_path = r"train_data_quad\salsa"
+bvh_reconstructed_dir_path = r"reconstructed_quad_bvh\salsa"
+
+
+#comment the following to run test_generate_data.py
+# Encode data from bvh to positional encoding
+generate_quad_traindata_from_bvh(bvh_dir_path, quad_enc_dir_path)
+
+# Decode from positional to bvh
+generate_bvh_from_quad_traindata(quad_enc_dir_path, bvh_reconstructed_dir_path)
+
+
+bvh_dir_path = r"C:\Users\alexa\OneDrive - University of Cyprus\Masters in Artificial Intelligence\2nd semester\ML For Graphics - 645\FINAL PROJECT\MAI645_Team_04\train_data_bvh\martial"
+quad_enc_dir_path = r"train_data_quad\martial"
+bvh_reconstructed_dir_path = r"reconstructed_quad_bvh\martial"
+
+
+#comment the following to run test_generate_data.py
+# Encode data from bvh to positional encoding
+generate_quad_traindata_from_bvh(bvh_dir_path, quad_enc_dir_path)
+
+# Decode from positional to bvh
+generate_bvh_from_quad_traindata(quad_enc_dir_path, bvh_reconstructed_dir_path)
