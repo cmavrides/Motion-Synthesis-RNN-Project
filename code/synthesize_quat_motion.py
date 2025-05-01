@@ -115,9 +115,9 @@ def test(dance_batch_np, frame_rate, batch, initial_seq_len, generate_frames_num
     generate_seq(dance_batch_np, generate_frames_number, model, write_bvh_motion_folder)
 
 # Define paths and parameters
-read_weight_path = "C:/Users/alexa/OneDrive - University of Cyprus/Masters in Artificial Intelligence/2nd semester/ML For Graphics - 645/FINAL PROJECT/MAI645_Team_04/results_quat_weights/0059000.weight"
+read_weight_path = "C:/Users/alexa/Desktop/MAI645_Team_04/results_quad/0060000.weight"
 write_bvh_motion_folder = "C:/Users/alexa/Desktop/result_quat/"
-dances_folder = "C:/Users/alexa/OneDrive - University of Cyprus/Masters in Artificial Intelligence/2nd semester/ML For Graphics - 645/FINAL PROJECT/MAI645_Team_04/train_data_quad/martial/"
+dances_folder = "C:/Users/alexa/Desktop/MAI645_Team_04/train_data_quad/martial/"
 dance_frame_rate = 60
 batch = 5
 initial_seq_len = 15
