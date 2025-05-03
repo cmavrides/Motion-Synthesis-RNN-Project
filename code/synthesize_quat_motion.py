@@ -1,4 +1,3 @@
-# filepath: c:\Users\alexa\OneDrive - University of Cyprus\Masters in Artificial Intelligence\2nd semester\ML For Graphics - 645\FINAL PROJECT\MAI645_Team_04\code\synthesize_quat_motion.py
 import os
 import torch
 import torch.nn as nn
@@ -6,148 +5,189 @@ import numpy as np
 import random
 import read_bvh
 
-# Define constants
+# index of the hip joint in your BVH data
 Hip_index = read_bvh.joint_index['hip']
-Seq_len = 100
-Hidden_size = 1024
-Condition_num = 5
+
+# model hyperparameters
+Seq_len        = 100
+Hidden_size    = 1024
+Joints_num     = 57
+Extra_dims     = 4
+
+# adjust frame size to match your checkpoint (57 joints * 3 + 4 extra dims = 175)
+In_frame_size  = Joints_num * 3 + Extra_dims   # 175
+Out_frame_size = In_frame_size                 # 175
+
+Condition_num   = 5
 Groundtruth_num = 5
 
-Joints_num = 57  # Keep this as is
-In_frame_size = 175  # Match the size from trained weights
-Out_frame_size = 175  # Match the size from trained weights
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-
-class acLSTMQuat(nn.Module):
-    def __init__(self, in_frame_size=175, hidden_size=1024, out_frame_size=175):
-        super(acLSTMQuat, self).__init__()
-
-        self.in_frame_size = in_frame_size
-        self.hidden_size = hidden_size
+class acLSTM(nn.Module):
+    def __init__(self, in_frame_size=171, hidden_size=1024, out_frame_size=171):
+        super(acLSTM, self).__init__()
+        self.in_frame_size  = in_frame_size
+        self.hidden_size    = hidden_size
         self.out_frame_size = out_frame_size
 
-        # LSTM layers
-        self.lstm1 = nn.LSTMCell(self.in_frame_size, self.hidden_size)
-        self.lstm2 = nn.LSTMCell(self.hidden_size, self.hidden_size)
-        self.lstm3 = nn.LSTMCell(self.hidden_size, self.hidden_size)
-        self.decoder = nn.Linear(self.hidden_size, self.out_frame_size)
+        # three-layer LSTM
+        self.lstm1   = nn.LSTMCell(self.in_frame_size, self.hidden_size)
+        self.lstm2   = nn.LSTMCell(self.hidden_size,   self.hidden_size)
+        self.lstm3   = nn.LSTMCell(self.hidden_size,   self.hidden_size)
+        self.decoder = nn.Linear(self.hidden_size,     self.out_frame_size)
 
     def init_hidden(self, batch):
-        c0 = torch.zeros(batch, self.hidden_size).cuda()
-        c1 = torch.zeros(batch, self.hidden_size).cuda()
-        c2 = torch.zeros(batch, self.hidden_size).cuda()
-        h0 = torch.zeros(batch, self.hidden_size).cuda()
-        h1 = torch.zeros(batch, self.hidden_size).cuda()
-        h2 = torch.zeros(batch, self.hidden_size).cuda()
+        # initialize h and c to zero
+        h0 = torch.zeros(batch, self.hidden_size, device=device)
+        h1 = torch.zeros(batch, self.hidden_size, device=device)
+        h2 = torch.zeros(batch, self.hidden_size, device=device)
+        c0 = torch.zeros(batch, self.hidden_size, device=device)
+        c1 = torch.zeros(batch, self.hidden_size, device=device)
+        c2 = torch.zeros(batch, self.hidden_size, device=device)
         return ([h0, h1, h2], [c0, c1, c2])
 
     def forward_lstm(self, in_frame, vec_h, vec_c):
-        vec_h0, vec_c0 = self.lstm1(in_frame, (vec_h[0], vec_c[0]))
-        vec_h1, vec_c1 = self.lstm2(vec_h[0], (vec_h[1], vec_c[1]))
-        vec_h2, vec_c2 = self.lstm3(vec_h[1], (vec_h[2], vec_c[2]))
-
-        out_frame = self.decoder(vec_h2)
-        vec_h_new = [vec_h0, vec_h1, vec_h2]
-        vec_c_new = [vec_c0, vec_c1, vec_c2]
-
-        return (out_frame, vec_h_new, vec_c_new)
+        h0, c0 = self.lstm1(in_frame,         (vec_h[0], vec_c[0]))
+        h1, c1 = self.lstm2(h0,               (vec_h[1], vec_c[1]))
+        h2, c2 = self.lstm3(h1,               (vec_h[2], vec_c[2]))
+        out_frame = self.decoder(h2)
+        return out_frame, [h0, h1, h2], [c0, c1, c2]
 
     def forward(self, initial_seq, generate_frames_number):
-        batch = initial_seq.size()[0]
-        (vec_h, vec_c) = self.init_hidden(batch)
+        batch = initial_seq.size(0)
+        vec_h, vec_c = self.init_hidden(batch)
 
-        out_seq = torch.zeros(batch, 1).cuda()
-        out_frame = torch.zeros(batch, self.out_frame_size).cuda()
+        # prepare output buffer (we'll drop the very first zero-frame later)
+        out_seq   = torch.zeros(batch, 1, self.out_frame_size, device=device)
+        out_frame = torch.zeros(batch,     self.out_frame_size, device=device)
 
-        for i in range(initial_seq.size()[1]):
-            in_frame = initial_seq[:, i]
-            (out_frame, vec_h, vec_c) = self.forward_lstm(in_frame, vec_h, vec_c)
-            out_seq = torch.cat((out_seq, out_frame), 1)
+        # feed in the seed sequence
+        for i in range(initial_seq.size(1)):
+            in_frame     = initial_seq[:, i, :]
+            out_frame, vec_h, vec_c = self.forward_lstm(in_frame, vec_h, vec_c)
+            out_seq      = torch.cat([out_seq, out_frame.unsqueeze(1)], dim=1)
 
-        for i in range(generate_frames_number):
-            in_frame = out_frame
-            (out_frame, vec_h, vec_c) = self.forward_lstm(in_frame, vec_h, vec_c)
-            out_seq = torch.cat((out_seq, out_frame), 1)
+        # generate new frames autoregressively
+        for _ in range(generate_frames_number):
+            in_frame     = out_frame
+            out_frame, vec_h, vec_c = self.forward_lstm(in_frame, vec_h, vec_c)
+            out_seq      = torch.cat([out_seq, out_frame.unsqueeze(1)], dim=1)
 
-        return out_seq[:, 1: out_seq.size()[1]]
+        # drop the initial zero frame
+        return out_seq[:, 1:, :]
 
     def calculate_loss(self, out_seq, groundtruth_seq):
-        loss_function = nn.MSELoss()
-        loss = loss_function(out_seq, groundtruth_seq)
-        return loss
+        return nn.MSELoss()(out_seq, groundtruth_seq)
+
 
 def generate_seq(initial_seq_np, generate_frames_number, model, save_dance_folder):
-    initial_seq = torch.FloatTensor(initial_seq_np).cuda()
-    predict_seq = model.forward(initial_seq, generate_frames_number)
+    """
+    initial_seq_np: numpy array of shape [batch, seq_len, frame_size]
+    """
+    batch, seq_len, _ = initial_seq_np.shape
 
-    batch = initial_seq_np.shape[0]
+    # compute frame-to-frame diff
+    dif     = initial_seq_np[:, 1:] - initial_seq_np[:, :-1]
+    # copy all but last frame
+    seq_dif = initial_seq_np[:, :-1].copy()
+
+    # only use diffs for hip X and Z; zero out hip Y diff
+    seq_dif[:, :, Hip_index*3    ] = dif[:, :, Hip_index*3]
+    seq_dif[:, :, Hip_index*3 + 1] = 0.0
+    seq_dif[:, :, Hip_index*3 + 2] = dif[:, :, Hip_index*3 + 2]
+
+    # send into the network
+    initial_seq  = torch.FloatTensor(seq_dif).to(device)
+    predict_seq  = model(initial_seq, generate_frames_number)
+
     for b in range(batch):
-        out_seq = np.array(predict_seq[b].data.tolist()).reshape(-1, In_frame_size)
-        # Here you would need to convert quaternion representation back to the desired format
-        # For example, you might want to convert quaternions to Euler angles or another format
-        # This part is left as a placeholder for your specific needs
+        out_seq   = predict_seq[b].cpu().detach().numpy().reshape(-1, In_frame_size)
+        init_hip_y = initial_seq_np[b, -1, Hip_index*3 + 1]
 
-        # Save the output sequence to a file
-        read_bvh.write_traindata_to_bvh(save_dance_folder + "out" + "%02d" % b + ".bvh", out_seq)
+        last_x = 0.0
+        last_z = 0.0
+        for f in range(out_seq.shape[0]):
+            # accumulate X & Z
+            out_seq[f, Hip_index*3    ] += last_x
+            last_x = out_seq[f, Hip_index*3    ]
+            out_seq[f, Hip_index*3 + 2] += last_z
+            last_z = out_seq[f, Hip_index*3 + 2]
 
-    return np.array(predict_seq.data.tolist()).reshape(batch, -1, In_frame_size)
+            # restore Y to the last seed height
+            out_seq[f, Hip_index*3 + 1] = init_hip_y
+
+        fn = os.path.join(save_dance_folder, f"out{b:02d}.bvh")
+        read_bvh.write_traindata_to_bvh(fn, out_seq)
+
+    return predict_seq.cpu().detach().numpy().reshape(batch, -1, In_frame_size)
+
+
+def get_dance_len_lst(dances):
+    len_lst = []
+    for d in dances:
+        length = max(int(len(d) / 100), 1)
+        len_lst.append(length)
+    index_lst = []
+    for idx, length in enumerate(len_lst):
+        index_lst += [idx] * length
+    return index_lst
+
 
 def load_dances(dance_folder):
-    dance_files = os.listdir(dance_folder)
+    files  = os.listdir(dance_folder)
     dances = []
-    for dance_file in dance_files:
-        print("load " + dance_file)
-        dance = np.load(dance_folder + dance_file)
-        print("frame number: " + str(dance.shape[0]))
-        dances.append(dance)
+    for fn in files:
+        print(f"load {fn}")
+        arr = np.load(os.path.join(dance_folder, fn))
+        print(f"frame number: {arr.shape[0]}")
+        dances.append(arr)
     return dances
 
-def test(dance_batch_np, frame_rate, batch, initial_seq_len, generate_frames_number, read_weight_path,
-         write_bvh_motion_folder, in_frame_size=175, hidden_size=1024, out_frame_size=175):
-    torch.cuda.set_device(0)
 
-    # Initialize and load pretrained weights
-    model = acLSTMQuat(in_frame_size, hidden_size, out_frame_size)
-    model.load_state_dict(torch.load(read_weight_path))
-    model.cuda()
+def test(dances, frame_rate, batch, initial_seq_len, generate_frames_number,
+         read_weight_path, write_bvh_motion_folder,
+         in_frame_size=In_frame_size, hidden_size=Hidden_size, out_frame_size=Out_frame_size):
 
+    # initialize model & load pretrained weights
+    model = acLSTM(in_frame_size, hidden_size, out_frame_size).to(device)
+    model.load_state_dict(torch.load(read_weight_path, map_location=device))
+
+    speed         = frame_rate / 30.0
+    dance_len_lst = get_dance_len_lst(dances)
+    random_range  = len(dance_len_lst)
+
+    dance_batch = []
+    for _ in range(batch):
+        dance_id = dance_len_lst[random.randint(0, random_range - 1)]
+        dance    = dances[dance_id]
+        L        = dance.shape[0]
+        start_id = random.randint(10, int(L - initial_seq_len*speed - 10))
+        seq      = [dance[int(i*speed + start_id)] for i in range(initial_seq_len)]
+        dance_batch.append(seq)
+
+    dance_batch_np = np.array(dance_batch)
     generate_seq(dance_batch_np, generate_frames_number, model, write_bvh_motion_folder)
 
-# Define paths and parameters
-read_weight_path = "C:/Users/alexa/Desktop/MAI645_Team_04/results_quad/0060000.weight"
-write_bvh_motion_folder = "C:/Users/alexa/Desktop/result_quat/"
-dances_folder = "C:/Users/alexa/Desktop/MAI645_Team_04/train_data_quad/martial/"
-dance_frame_rate = 60
-batch = 5
-initial_seq_len = 15
-generate_frames_number = 400
 
-if not os.path.exists(write_bvh_motion_folder):
-    os.makedirs(write_bvh_motion_folder)
+if __name__ == "__main__":
+    read_weight_path        = "../results_quad/0060000.weight"
+    write_bvh_motion_folder = "./quad_out_bvh/"
+    dances_folder           = "../train_data_quad/martial/"
+    dance_frame_rate        = 60
+    batch                   = 5
+    initial_seq_len         = 15
+    generate_frames_number  = 400
 
-dances = load_dances(dances_folder)
+    os.makedirs(write_bvh_motion_folder, exist_ok=True)
+    dances = load_dances(dances_folder)
 
-# Replace the batch loading code with this:
-def prepare_dance_batch(dances, batch_size, initial_seq_len):
-    batch_data = []
-    for i in range(batch_size):
-        if i >= len(dances):
-            break
-        dance = dances[i]
-        # Take only the initial sequence length we need
-        if len(dance) > initial_seq_len:
-            # Randomly select a starting point
-            start_idx = random.randint(0, len(dance) - initial_seq_len)
-            sequence = dance[start_idx:start_idx + initial_seq_len]
-        else:
-            # If sequence is too short, pad with zeros
-            sequence = np.pad(dance, ((0, initial_seq_len - len(dance)), (0, 0)), 'constant')
-        batch_data.append(sequence)
-
-    return np.array(batch_data)
-
-# Replace the batch loading line with:
-dance_batch_np = prepare_dance_batch(dances, batch, initial_seq_len)
-test(dance_batch_np, dance_frame_rate, batch, initial_seq_len, generate_frames_number, read_weight_path,
-     write_bvh_motion_folder, In_frame_size, Hidden_size, Out_frame_size)
+    test(
+        dances,
+        dance_frame_rate,
+        batch,
+        initial_seq_len,
+        generate_frames_number,
+        read_weight_path,
+        write_bvh_motion_folder
+    )
