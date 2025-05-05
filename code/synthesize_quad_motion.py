@@ -8,7 +8,7 @@ import read_bvh
 Hip_index = read_bvh.joint_index['hip']
 
 Joints_num = 57
-In_frame_size = Joints_num * 3
+In_frame_size = 227
 Hidden_size = 1024
 
 class acLSTM(nn.Module):
@@ -88,9 +88,9 @@ def synthesize_motion(dances, args):
 
 # === Settings ===
 args = {
-    "model_weights": "C:/Users/alexa/Desktop/MAI645_Team_04/results_quat_weights/0000000.weight",                   # Path to the trained model weights
+    "model_weights": "C:/Users/alexa/Desktop/MAI645_Team_04/results_quad_weights_v4/0001000.weight",                   # Path to the trained model weights
     "dances_folder": "C:/Users/alexa/Desktop/MAI645_Team_04/train_data_quad/martial/",                      # Path to the folder with quad .npy files
-    "output_dir": "C:/Users/alexa/Desktop/result_quat/",                                                    # Where to save the .bvh outputs
+    "output_dir": "C:/Users/alexa/Desktop/result_quat_fourth/",                                                    # Where to save the .bvh outputs
     "frame_rate": 60,
     "batch": 5,
     "initial_seq_len": 15,
