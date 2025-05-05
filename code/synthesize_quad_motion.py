@@ -4,15 +4,16 @@ import torch.nn as nn
 import numpy as np
 import random
 import read_bvh
+from scipy.spatial.transform import Rotation as R
 
 Hip_index = read_bvh.joint_index['hip']
 
-Joints_num = 57
+Joints_num = 56  # Should match training (227 = 3 + 56*4)
 In_frame_size = 227
 Hidden_size = 1024
 
 class acLSTM(nn.Module):
-    def __init__(self, in_frame_size=171, hidden_size=1024, out_frame_size=171):
+    def __init__(self, in_frame_size=227, hidden_size=1024, out_frame_size=227):
         super(acLSTM, self).__init__()
         self.in_frame_size = in_frame_size
         self.hidden_size = hidden_size
@@ -65,7 +66,16 @@ def generate_seq(initial_seq_np, generate_frames_number, model, save_folder):
 
     for b in range(out_tensor.size(0)):
         seq = out_tensor[b].detach().cpu().numpy().reshape(-1, In_frame_size)
-        read_bvh.write_traindata_to_bvh(os.path.join(save_folder, f"out{b:02d}.bvh"), seq)
+        root = seq[:, :3]
+        quats = seq[:, 3:].reshape(seq.shape[0], -1, 4)
+        quats = quats / (np.linalg.norm(quats, axis=-1, keepdims=True) + 1e-8)
+        num_frames = quats.shape[0]
+        num_joints = quats.shape[1]
+        quats_flat = quats.reshape(-1, 4)
+        eulers_flat = R.from_quat(quats_flat).as_euler('zxy', degrees=True)
+        eulers = eulers_flat.reshape(num_frames, num_joints * 3)
+        bvh_data = np.concatenate([root, eulers], axis=1)
+        read_bvh.write_traindata_to_bvh(os.path.join(save_folder, f"out{b:02d}.bvh"), bvh_data)
 
 def synthesize_motion(dances, args):
     model = acLSTM(In_frame_size, Hidden_size, In_frame_size).cuda()
@@ -88,9 +98,9 @@ def synthesize_motion(dances, args):
 
 # === Settings ===
 args = {
-    "model_weights": "C:/Users/alexa/Desktop/MAI645_Team_04/results_quad_weights_v4/0001000.weight",                   # Path to the trained model weights
-    "dances_folder": "C:/Users/alexa/Desktop/MAI645_Team_04/train_data_quad/martial/",                      # Path to the folder with quad .npy files
-    "output_dir": "C:/Users/alexa/Desktop/result_quat_fourth/",                                                    # Where to save the .bvh outputs
+    "model_weights": "C:/Users/alexa/Desktop/MAI645_Team_04/results_quad_weights_v4/0001000.weight",
+    "dances_folder": "C:/Users/alexa/Desktop/MAI645_Team_04/train_data_quad/martial/",
+    "output_dir": "C:/Users/alexa/Desktop/result_quat_fourth/",
     "frame_rate": 60,
     "batch": 5,
     "initial_seq_len": 15,
