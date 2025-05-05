@@ -1,176 +1,201 @@
 import os
 import torch
 import torch.nn as nn
+from torch.autograd import Variable
 import numpy as np
 import random
 import read_bvh
 import argparse
 
 Hip_index = read_bvh.joint_index['hip']
+
 Seq_len = 100
 Hidden_size = 1024
-Joints_num = 56
+Joints_num = 56  # 56 joints for quaternion data (227 = 3 + 56*4)
 Condition_num = 5
 Groundtruth_num = 5
-In_frame_size = Joints_num * 4  # 4 for quaternion, not 3
+In_frame_size = 227  # 3 root + 56*4 quaternion
 
 class acLSTM(nn.Module):
-    def __init__(self, in_frame_size=171, hidden_size=1024, out_frame_size=171):
+    def __init__(self, in_frame_size=227, hidden_size=1024, out_frame_size=227):
         super(acLSTM, self).__init__()
         self.in_frame_size = in_frame_size
         self.hidden_size = hidden_size
         self.out_frame_size = out_frame_size
 
-        self.lstm1 = nn.LSTMCell(in_frame_size, hidden_size)
-        self.lstm2 = nn.LSTMCell(hidden_size, hidden_size)
-        self.lstm3 = nn.LSTMCell(hidden_size, hidden_size)
-        self.decoder = nn.Linear(hidden_size, out_frame_size)
+        self.lstm1 = nn.LSTMCell(self.in_frame_size, self.hidden_size)
+        self.lstm2 = nn.LSTMCell(self.hidden_size, self.hidden_size)
+        self.lstm3 = nn.LSTMCell(self.hidden_size, self.hidden_size)
+        self.decoder = nn.Linear(self.hidden_size, self.out_frame_size)
 
     def init_hidden(self, batch):
-        zeros = lambda: torch.zeros(batch, self.hidden_size).cuda()
-        return [zeros() for _ in range(3)], [zeros() for _ in range(3)]
+        c0 = torch.zeros((batch, self.hidden_size), device='cuda')
+        c1 = torch.zeros((batch, self.hidden_size), device='cuda')
+        c2 = torch.zeros((batch, self.hidden_size), device='cuda')
+        h0 = torch.zeros((batch, self.hidden_size), device='cuda')
+        h1 = torch.zeros((batch, self.hidden_size), device='cuda')
+        h2 = torch.zeros((batch, self.hidden_size), device='cuda')
+        return ([h0, h1, h2], [c0, c1, c2])
 
     def forward_lstm(self, in_frame, vec_h, vec_c):
-        h0, c0 = self.lstm1(in_frame, (vec_h[0], vec_c[0]))
-        h1, c1 = self.lstm2(h0, (vec_h[1], vec_c[1]))
-        h2, c2 = self.lstm3(h1, (vec_h[2], vec_c[2]))
-        out = self.decoder(h2)
-        return out, [h0, h1, h2], [c0, c1, c2]
+        vec_h0, vec_c0 = self.lstm1(in_frame, (vec_h[0], vec_c[0]))
+        vec_h1, vec_c1 = self.lstm2(vec_h0, (vec_h[1], vec_c[1]))
+        vec_h2, vec_c2 = self.lstm3(vec_h1, (vec_h[2], vec_c[2]))
+        out_frame = self.decoder(vec_h2)
+        vec_h_new = [vec_h0, vec_h1, vec_h2]
+        vec_c_new = [vec_c0, vec_c1, vec_c2]
+        return (out_frame, vec_h_new, vec_c_new)
 
     def get_condition_lst(self, condition_num, groundtruth_num, seq_len):
-        gt = np.ones((100, groundtruth_num))
-        cond = np.zeros((100, condition_num))
-        mask = np.concatenate((gt, cond), axis=1).reshape(-1)
-        return mask[:seq_len]
+        gt_lst = np.ones((100, groundtruth_num))
+        con_lst = np.zeros((100, condition_num))
+        lst = np.concatenate((gt_lst, con_lst), 1).reshape(-1)
+        return lst[0:seq_len]
 
     def forward(self, real_seq, condition_num=5, groundtruth_num=5):
-        batch = real_seq.size(0)
-        seq_len = real_seq.size(1)
+        batch = real_seq.size()[0]
+        seq_len = real_seq.size()[1]
         condition_lst = self.get_condition_lst(condition_num, groundtruth_num, seq_len)
-        vec_h, vec_c = self.init_hidden(batch)
-        out_seq = torch.zeros(batch, 0).cuda()
-        out_frame = torch.zeros(batch, self.out_frame_size).cuda()
-
+        (vec_h, vec_c) = self.init_hidden(batch)
+        out_seq = torch.zeros((batch, 1), device='cuda')
+        out_frame = torch.zeros((batch, self.out_frame_size), device='cuda')
         for i in range(seq_len):
-            in_frame = real_seq[:, i] if condition_lst[i] == 1 else out_frame
+            if condition_lst[i] == 1:
+                in_frame = real_seq[:, i]
+            else:
+                in_frame = out_frame
             out_frame, vec_h, vec_c = self.forward_lstm(in_frame, vec_h, vec_c)
-            out_seq = torch.cat((out_seq, out_frame), dim=1)
-
-        return out_seq
+            out_seq = torch.cat((out_seq, out_frame), 1)
+        return out_seq[:, 1: out_seq.size()[1]]
 
     def calculate_loss(self, out_seq, groundtruth_seq):
         B, TF = out_seq.shape
-        F     = self.out_frame_size
-        T     = TF // F
+        F = self.out_frame_size
+        T = TF // F
         root_dim = 3
         quat_dim = 4
         J = (F - root_dim) // quat_dim
 
+        # Root translation loss
+        pred_root = out_seq.view(B, T, F)[:, :, :root_dim]
+        true_root = groundtruth_seq.view(B, T, F)[:, :, :root_dim]
+        root_loss = torch.nn.functional.mse_loss(pred_root, true_root)
+
+        # Quaternion loss (geodesic)
         pred_q = out_seq.view(B, T, F)[:, :, root_dim:].contiguous().view(B, T, J, quat_dim)
         true_q = groundtruth_seq.view(B, T, F)[:, :, root_dim:].contiguous().view(B, T, J, quat_dim)
-
-        # Normalize quaternions to unit length
         pred_q = pred_q / (pred_q.norm(dim=-1, keepdim=True) + 1e-8)
         true_q = true_q / (true_q.norm(dim=-1, keepdim=True) + 1e-8)
-
-        # Geodesic loss (angle between quaternions)
         dot = (pred_q * true_q).sum(dim=-1).abs().clamp(1e-6, 1.0 - 1e-6)
-        loss = 2.0 * torch.acos(dot)
-        return loss.mean()
+        quat_loss = 2.0 * torch.acos(dot)
+        quat_loss = quat_loss.mean()
 
+        return root_loss + quat_loss
 
-def load_dances(folder):
-    files = [f for f in os.listdir(folder) if f.endswith(".npy")]
-    print(f"Loading {len(files)} quad motion files...")
-    return [np.load(os.path.join(folder, f)) for f in files]
+def train_one_iteration(real_seq_np, model, optimizer, iteration, save_dance_folder, print_loss=False, save_bvh_motion=True):
+    real_seq = torch.tensor(real_seq_np, dtype=torch.float32, device='cuda')
+    seq_len = real_seq.size()[1] - 1
+    in_real_seq = real_seq[:, 0:seq_len]
+    predict_groundtruth_seq = real_seq[:, 1:seq_len+1].contiguous().view(real_seq_np.shape[0], -1)
+    predict_seq = model.forward(in_real_seq, Condition_num, Groundtruth_num)
+    optimizer.zero_grad()
+    loss = model.calculate_loss(predict_seq, predict_groundtruth_seq)
+    loss.backward()
+    optimizer.step()
+    if print_loss:
+        print("########### iter %07d ######################" % iteration)
+        print("loss: " + str(loss.detach().cpu().numpy()))
+    if save_bvh_motion:
+        gt_seq = np.array(predict_groundtruth_seq[0].data.tolist()).reshape(-1, In_frame_size)
+        out_seq = np.array(predict_seq[0].data.tolist()).reshape(-1, In_frame_size)
+        read_bvh.write_traindata_to_bvh(os.path.join(save_dance_folder, "%07d_gt.bvh" % iteration), gt_seq)
+        read_bvh.write_traindata_to_bvh(os.path.join(save_dance_folder, "%07d_out.bvh" % iteration), out_seq)
 
 def get_dance_len_lst(dances):
-    return [i for i, dance in enumerate(dances) for _ in range(max(1, 10))]
+    len_lst = []
+    for dance in dances:
+        length = 10
+        if length < 1:
+            length = 1
+        len_lst = len_lst + [length]
+    index_lst = []
+    index = 0
+    for length in len_lst:
+        for i in range(length):
+            index_lst = index_lst + [index]
+        index = index + 1
+    return index_lst
 
-def train_one_iteration(batch_np, model, optimizer, iteration, save_folder, args, print_loss=False, save_bvh=False):
-    real_seq = torch.tensor(batch_np, dtype=torch.float32).cuda()
-    in_seq = real_seq[:, :-1]
-    target_seq = real_seq[:, 1:].contiguous().view(real_seq.size(0), -1)
+def load_dances(dance_folder):
+    dance_files = os.listdir(dance_folder)
+    dances = []
+    print('Loading motion files...')
+    for dance_file in dance_files:
+        dance = np.load(os.path.join(dance_folder, dance_file))
+        dances = dances + [dance]
+    print(len(dances), ' Motion files loaded')
+    return dances
 
-    output_seq = model(in_seq, Condition_num, Groundtruth_num)
-    loss = model.calculate_loss(output_seq, target_seq)
-
-    optimizer.zero_grad()
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-    optimizer.step()
-
-    if print_loss:
-        print(f"### Iteration {iteration:07d} ###\nLoss: {loss.item():.6f}")
-
-    if save_bvh:
-        out_np = output_seq[0].detach().cpu().numpy()
-        num_frames = out_np.shape[0] // args.out_frame
-        out_np = out_np[:num_frames * args.out_frame].reshape(num_frames, args.out_frame)
-
-        gt_np = target_seq[0].detach().cpu().numpy()
-        num_frames_gt = gt_np.shape[0] // args.out_frame
-        gt_np = gt_np[:num_frames_gt * args.out_frame].reshape(num_frames_gt, args.out_frame)
-
-        read_bvh.write_traindata_to_bvh(os.path.join(save_folder, f"{iteration:07d}_gt.bvh"), gt_np)
-        read_bvh.write_traindata_to_bvh(os.path.join(save_folder, f"{iteration:07d}_out.bvh"), out_np)
-
-def train(dances, args):
-    model = acLSTM(in_frame_size=args.in_frame, hidden_size=args.hidden_size, out_frame_size=args.out_frame).cuda()
-
-    if args.read_weight_path:
-        model.load_state_dict(torch.load(args.read_weight_path))
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+def train(dances, frame_rate, batch, seq_len, read_weight_path, write_weight_folder,
+          write_bvh_motion_folder, in_frame, out_frame, hidden_size=1024, total_iter=500000):
+    seq_len = seq_len + 2
+    torch.cuda.set_device(0)
+    model = acLSTM(in_frame_size=in_frame, hidden_size=hidden_size, out_frame_size=out_frame)
+    if read_weight_path != "":
+        model.load_state_dict(torch.load(read_weight_path))
+    model.cuda()
+    current_lr = 0.0001
+    optimizer = torch.optim.Adam(model.parameters(), lr=current_lr)
     model.train()
-
     dance_len_lst = get_dance_len_lst(dances)
-    speed = args.dance_frame_rate / 30
-
-    for iteration in range(args.total_iterations):
-        batch = []
-        for _ in range(args.batch_size):
-            dance_id = random.choice(dance_len_lst)
-            dance = dances[dance_id]
-            start = random.randint(10, len(dance) - (args.seq_len + 2) * int(speed) - 10)
-            sample = [dance[int(start + i * speed)] for i in range(args.seq_len + 2)]
-
+    random_range = len(dance_len_lst)
+    speed = frame_rate / 30
+    for iteration in range(total_iter):
+        dance_batch = []
+        for b in range(batch):
+            dance_id = dance_len_lst[np.random.randint(0, random_range)]
+            dance = dances[dance_id].copy()
+            dance_len = dance.shape[0]
+            start_id = random.randint(10, int(dance_len - seq_len * speed - 10))
+            sample_seq = []
+            for i in range(seq_len):
+                sample_seq = sample_seq + [dance[int(i * speed + start_id)]]
             T = [0.1 * (random.random() - 0.5), 0.0, 0.1 * (random.random() - 0.5)]
             R = [0, 1, 0, (random.random() - 0.5) * np.pi * 2]
-            aug = read_bvh.augment_train_data(sample, T, R)
-            batch.append(aug)
-
-        batch_np = np.array(batch)
-
-        print_loss = (iteration % 20 == 0)
-        save_bvh = (iteration % 1000 == 0)
-
-        if save_bvh:
-            torch.save(model.state_dict(), os.path.join(args.write_weight_folder, f"{iteration:07d}.weight"))
-
-        train_one_iteration(batch_np, model, optimizer, iteration, args.write_bvh_motion_folder, args, print_loss, save_bvh)
+            sample_seq_augmented = read_bvh.augment_train_data(sample_seq, T, R)
+            dance_batch = dance_batch + [sample_seq_augmented]
+        dance_batch_np = np.array(dance_batch)
+        print_loss = False
+        save_bvh_motion = False
+        if iteration % 20 == 0:
+            print_loss = True
+        if iteration % 1000 == 0:
+            save_bvh_motion = True
+            path = os.path.join(write_weight_folder, "%07d.weight" % iteration)
+            torch.save(model.state_dict(), path)
+        train_one_iteration(dance_batch_np, model, optimizer, iteration, write_bvh_motion_folder, print_loss, save_bvh_motion)
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dances_folder', type=str, required=True)
-    parser.add_argument('--write_weight_folder', type=str, required=True)
-    parser.add_argument('--write_bvh_motion_folder', type=str, required=True)
-    parser.add_argument('--read_weight_path', type=str, default="")
-    parser.add_argument('--dance_frame_rate', type=int, default=60)
-    parser.add_argument('--batch_size', type=int, default=32)
-    parser.add_argument('--in_frame', type=int, default=In_frame_size)
-    parser.add_argument('--out_frame', type=int, default=In_frame_size)
-    parser.add_argument('--hidden_size', type=int, default=1024)
-    parser.add_argument('--seq_len', type=int, default=100)
-    parser.add_argument('--total_iterations', type=int, default=100000)
-
+    parser.add_argument('--dances_folder', type=str, required=True, help='Path for the training data')
+    parser.add_argument('--write_weight_folder', type=str, required=True, help='Path to store checkpoints')
+    parser.add_argument('--write_bvh_motion_folder', type=str, required=True, help='Path to store test generated bvh')
+    parser.add_argument('--read_weight_path', type=str, default="", help='Checkpoint model path')
+    parser.add_argument('--dance_frame_rate', type=int, default=60, help='Dance frame rate')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
+    parser.add_argument('--in_frame', type=int, required=True, help='Input channel')
+    parser.add_argument('--out_frame', type=int, required=True, help='Output channels')
+    parser.add_argument('--hidden_size', type=int, default=1024, help='Checkpoint model path')
+    parser.add_argument('--seq_len', type=int, default=100, help='Checkpoint model path')
+    parser.add_argument('--total_iterations', type=int, default=100000, help='Checkpoint model path')
     args = parser.parse_args()
-
-    os.makedirs(args.write_weight_folder, exist_ok=True)
-    os.makedirs(args.write_bvh_motion_folder, exist_ok=True)
-
+    if not os.path.exists(args.write_weight_folder):
+        os.makedirs(args.write_weight_folder)
+    if not os.path.exists(args.write_bvh_motion_folder):
+        os.makedirs(args.write_bvh_motion_folder)
     dances = load_dances(args.dances_folder)
-    train(dances, args)
+    train(dances, args.dance_frame_rate, args.batch_size, args.seq_len, args.read_weight_path, args.write_weight_folder,
+          args.write_bvh_motion_folder, args.in_frame, args.out_frame, args.hidden_size, total_iter=args.total_iterations)
 
 if __name__ == '__main__':
     main()
