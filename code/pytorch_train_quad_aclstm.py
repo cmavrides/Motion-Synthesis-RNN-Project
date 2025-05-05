@@ -74,7 +74,7 @@ class acLSTM(nn.Module):
         true_q = true_q / (true_q.norm(dim=-1, keepdim=True) + 1e-8)
 
         # Geodesic loss (angle between quaternions)
-        dot = (pred_q * true_q).sum(dim=-1).abs().clamp(0.0, 1.0)
+        dot = (pred_q * true_q).sum(dim=-1).abs().clamp(1e-6, 1.0 - 1e-6)
         loss = 2.0 * torch.acos(dot)
         return loss.mean()
 
