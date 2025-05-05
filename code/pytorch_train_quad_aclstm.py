@@ -59,48 +59,38 @@ class acLSTM(nn.Module):
         return out_seq
 
     def calculate_loss(self, out_seq, groundtruth_seq):
-        """
-        Quaternion‐angle loss:
-            For each joint at each time step
-              1) convert axis‐angle (v) → quaternion q = [cos(||v||/2),  sin(||v||/2)*(v/||v||)]
-              2) compute dot = q_pred · q_true
-              3) loss = 2 * arccos(|dot|)
-            then average over batch, time, joints.
-        """
-        # shapes: [B, T*F]  where F = num_joints*3
         B, TF = out_seq.shape
-        F = self.out_frame_size
-        T = TF // F
-        # --- reshape to [B, T, J, 3]
-        J = F // 3
+        F     = self.out_frame_size
+        T     = TF // F
+        J     = F // 3
+
         pred_aa = out_seq.view(B, T, J, 3)
         true_aa = groundtruth_seq.view(B, T, J, 3)
 
-        # --- axis‐angle → quaternion
-        # predicted
-        angle_p = torch.norm(pred_aa, dim=-1, keepdim=True)           # [B,T,J,1]
-        axis_p  = pred_aa / (angle_p + 1e-8)                          # safe‐div
-        qw_p    = torch.cos(angle_p * 0.5)                            # scalar part
-        qv_p    = axis_p * torch.sin(angle_p * 0.5)                   # vector part
-        q_p     = torch.cat([qw_p, qv_p], dim=-1)                     # [B,T,J,4]
+        eps = 1e-6
 
-        # ground‐truth
-        angle_t = torch.norm(true_aa, dim=-1, keepdim=True)
-        axis_t  = true_aa / (angle_t + 1e-8)
-        qw_t    = torch.cos(angle_t * 0.5)
-        qv_t    = axis_t * torch.sin(angle_t * 0.5)
-        q_t     = torch.cat([qw_t, qv_t], dim=-1)                     # [B,T,J,4]
+        # axis‐angle → quaternion (predicted)
+        ang_p = pred_aa.norm(dim=-1, keepdim=True)            # [B,T,J,1]
+        ax_p  = pred_aa / (ang_p + eps)
+        qw_p  = torch.cos(ang_p * 0.5)
+        qv_p  = ax_p * torch.sin(ang_p * 0.5)
+        q_p   = torch.cat([qw_p, qv_p], dim=-1)               # [B,T,J,4]
 
-        # --- dot‐product and angle
-        # sum over the 4 quaternion dims
-        dot = torch.sum(q_p * q_t, dim=-1)                            # [B,T,J]
-        dot = torch.clamp(torch.abs(dot), max=1.0)                    # numerical safety
+        # axis‐angle → quaternion (ground truth)
+        ang_t = true_aa.norm(dim=-1, keepdim=True)
+        ax_t  = true_aa / (ang_t + eps)
+        qw_t  = torch.cos(ang_t * 0.5)
+        qv_t  = ax_t * torch.sin(ang_t * 0.5)
+        q_t   = torch.cat([qw_t, qv_t], dim=-1)
 
-        # quaternion‐angle loss
-        ql = 2.0 * torch.acos(dot)                                    # [B,T,J]
+        # dot‐product and stable angle
+        dot = (q_p * q_t).sum(dim=-1).abs().clamp(0.0, 1.0)     # [B,T,J]
+        # either of these:
+        ql = 2.0 * torch.acos(dot)
+        # ql = 2.0 * torch.atan2(torch.sqrt(1 - dot*dot), dot)
 
-        # mean over batch, time and joints
         return ql.mean()
+
 
 def load_dances(folder):
     files = [f for f in os.listdir(folder) if f.endswith(".npy")]
@@ -120,6 +110,7 @@ def train_one_iteration(batch_np, model, optimizer, iteration, save_folder, prin
 
     optimizer.zero_grad()
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
 
     if print_loss:
