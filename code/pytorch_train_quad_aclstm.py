@@ -9,10 +9,10 @@ import argparse
 Hip_index = read_bvh.joint_index['hip']
 Seq_len = 100
 Hidden_size = 1024
-Joints_num = 57
+Joints_num = 56
 Condition_num = 5
 Groundtruth_num = 5
-In_frame_size = Joints_num * 3
+In_frame_size = Joints_num * 4  # 4 for quaternion, not 3
 
 class acLSTM(nn.Module):
     def __init__(self, in_frame_size=171, hidden_size=1024, out_frame_size=171):
@@ -62,34 +62,21 @@ class acLSTM(nn.Module):
         B, TF = out_seq.shape
         F     = self.out_frame_size
         T     = TF // F
-        J     = F // 3
+        root_dim = 3
+        quat_dim = 4
+        J = (F - root_dim) // quat_dim
 
-        pred_aa = out_seq.view(B, T, J, 3)
-        true_aa = groundtruth_seq.view(B, T, J, 3)
+        pred_q = out_seq.view(B, T, F)[:, :, root_dim:].contiguous().view(B, T, J, quat_dim)
+        true_q = groundtruth_seq.view(B, T, F)[:, :, root_dim:].contiguous().view(B, T, J, quat_dim)
 
-        eps = 1e-6
+        # Normalize quaternions to unit length
+        pred_q = pred_q / (pred_q.norm(dim=-1, keepdim=True) + 1e-8)
+        true_q = true_q / (true_q.norm(dim=-1, keepdim=True) + 1e-8)
 
-        # axis‐angle → quaternion (predicted)
-        ang_p = pred_aa.norm(dim=-1, keepdim=True)            # [B,T,J,1]
-        ax_p  = pred_aa / (ang_p + eps)
-        qw_p  = torch.cos(ang_p * 0.5)
-        qv_p  = ax_p * torch.sin(ang_p * 0.5)
-        q_p   = torch.cat([qw_p, qv_p], dim=-1)               # [B,T,J,4]
-
-        # axis‐angle → quaternion (ground truth)
-        ang_t = true_aa.norm(dim=-1, keepdim=True)
-        ax_t  = true_aa / (ang_t + eps)
-        qw_t  = torch.cos(ang_t * 0.5)
-        qv_t  = ax_t * torch.sin(ang_t * 0.5)
-        q_t   = torch.cat([qw_t, qv_t], dim=-1)
-
-        # dot‐product and stable angle
-        dot = (q_p * q_t).sum(dim=-1).abs().clamp(0.0, 1.0)     # [B,T,J]
-        # either of these:
-        ql = 2.0 * torch.acos(dot)
-        # ql = 2.0 * torch.atan2(torch.sqrt(1 - dot*dot), dot)
-
-        return ql.mean()
+        # Geodesic loss (angle between quaternions)
+        dot = (pred_q * true_q).sum(dim=-1).abs().clamp(0.0, 1.0)
+        loss = 2.0 * torch.acos(dot)
+        return loss.mean()
 
 
 def load_dances(folder):
@@ -100,7 +87,7 @@ def load_dances(folder):
 def get_dance_len_lst(dances):
     return [i for i, dance in enumerate(dances) for _ in range(max(1, 10))]
 
-def train_one_iteration(batch_np, model, optimizer, iteration, save_folder, print_loss=False, save_bvh=False):
+def train_one_iteration(batch_np, model, optimizer, iteration, save_folder, args, print_loss=False, save_bvh=False):
     real_seq = torch.tensor(batch_np, dtype=torch.float32).cuda()
     in_seq = real_seq[:, :-1]
     target_seq = real_seq[:, 1:].contiguous().view(real_seq.size(0), -1)
@@ -117,8 +104,14 @@ def train_one_iteration(batch_np, model, optimizer, iteration, save_folder, prin
         print(f"### Iteration {iteration:07d} ###\nLoss: {loss.item():.6f}")
 
     if save_bvh:
-        out_np = output_seq[0].detach().cpu().numpy().reshape(-1, In_frame_size)
-        gt_np = target_seq[0].detach().cpu().numpy().reshape(-1, In_frame_size)
+        out_np = output_seq[0].detach().cpu().numpy()
+        num_frames = out_np.shape[0] // args.out_frame
+        out_np = out_np[:num_frames * args.out_frame].reshape(num_frames, args.out_frame)
+
+        gt_np = target_seq[0].detach().cpu().numpy()
+        num_frames_gt = gt_np.shape[0] // args.out_frame
+        gt_np = gt_np[:num_frames_gt * args.out_frame].reshape(num_frames_gt, args.out_frame)
+
         read_bvh.write_traindata_to_bvh(os.path.join(save_folder, f"{iteration:07d}_gt.bvh"), gt_np)
         read_bvh.write_traindata_to_bvh(os.path.join(save_folder, f"{iteration:07d}_out.bvh"), out_np)
 
@@ -155,7 +148,7 @@ def train(dances, args):
         if save_bvh:
             torch.save(model.state_dict(), os.path.join(args.write_weight_folder, f"{iteration:07d}.weight"))
 
-        train_one_iteration(batch_np, model, optimizer, iteration, args.write_bvh_motion_folder, print_loss, save_bvh)
+        train_one_iteration(batch_np, model, optimizer, iteration, args.write_bvh_motion_folder, args, print_loss, save_bvh)
 
 def main():
     parser = argparse.ArgumentParser()
