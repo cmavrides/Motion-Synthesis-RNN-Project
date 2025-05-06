@@ -49,6 +49,20 @@ class acLSTM(nn.Module):
         for _ in range(generate_frames_number):
             in_frame = out_frame
             out_frame, vec_h, vec_c = self.forward_lstm(in_frame, vec_h, vec_c)
+
+            # Normalize quaternion part of the output
+            # This ensures model predictions always produce valid unit quaternions
+            B = out_frame.size(0)
+            F = self.out_frame_size
+            root_dim = 3
+            quat_dim = 4
+            J = (F - root_dim) // quat_dim
+
+            out_frame_view = out_frame.view(B, F)
+            quats = out_frame_view[:, root_dim:].view(B, J, quat_dim)
+            quats = quats / (quats.norm(dim=-1, keepdim=True) + 1e-8)
+            out_frame_view[:, root_dim:] = quats.view(B, J * quat_dim)
+
             out_seq = torch.cat((out_seq, out_frame), dim=1)
 
         return out_seq
@@ -66,15 +80,47 @@ def generate_seq(initial_seq_np, generate_frames_number, model, save_folder):
 
     for b in range(out_tensor.size(0)):
         seq = out_tensor[b].detach().cpu().numpy().reshape(-1, In_frame_size)
-        root = seq[:, :3]
+
+        # Diagnostic information - helpful for debugging
+        print(f"First frame root: {seq[0, :3]}")
+        print(f"First frame quaternion norms: {np.linalg.norm(seq[0, 3:].reshape(-1, 4), axis=1)}")
+
+        # Clamp root translation to reasonable values
+        root = np.clip(seq[:, :3], -2, 2)
+
+        # Handle quaternions with extra care
         quats = seq[:, 3:].reshape(seq.shape[0], -1, 4)
+
+        # Check for and handle near-zero quaternions
+        quats_norm = np.linalg.norm(quats, axis=-1, keepdims=True)
+        min_norm = 1e-2  # Minimum acceptable norm
+
+        # Create a mask for quaternions with small norms
+        small_norm_mask = quats_norm < min_norm
+
+        # Replace small norm quaternions with identity quaternion [1,0,0,0]
+        identity_quat = np.array([1.0, 0.0, 0.0, 0.0])
+        for i in range(quats.shape[0]):
+            for j in range(quats.shape[1]):
+                if quats_norm[i, j, 0] < min_norm:
+                    quats[i, j] = identity_quat
+
+        # Normalize all quaternions to unit length
         quats = quats / (np.linalg.norm(quats, axis=-1, keepdims=True) + 1e-8)
+
+        # Reshape for conversion
         num_frames = quats.shape[0]
         num_joints = quats.shape[1]
         quats_flat = quats.reshape(-1, 4)
+
+        # Convert to Euler angles for BVH
         eulers_flat = R.from_quat(quats_flat).as_euler('zxy', degrees=True)
         eulers = eulers_flat.reshape(num_frames, num_joints * 3)
+
+        # Combine root and joint rotations
         bvh_data = np.concatenate([root, eulers], axis=1)
+
+        # Write to BVH file
         read_bvh.write_traindata_to_bvh(os.path.join(save_folder, f"out{b:02d}.bvh"), bvh_data)
 
 def synthesize_motion(dances, args):
@@ -98,7 +144,7 @@ def synthesize_motion(dances, args):
 
 # === Settings ===
 args = {
-    "model_weights": "C:/Users/alexa/Desktop/MAI645_Team_04/results_quad_weights_v4/0001000.weight",
+    "model_weights": "C:/Users/alexa/Desktop/MAI645_Team_04/results_quad_weights_v4/0007000.weight",
     "dances_folder": "C:/Users/alexa/Desktop/MAI645_Team_04/train_data_quad/martial/",
     "output_dir": "C:/Users/alexa/Desktop/result_quat_fourth/",
     "frame_rate": 60,
@@ -107,6 +153,7 @@ args = {
     "generate_frames": 400
 }
 
-os.makedirs(args["output_dir"], exist_ok=True)
-dances = load_dances(args["dances_folder"])
-synthesize_motion(dances, args)
+if __name__ == "__main__":
+    os.makedirs(args["output_dir"], exist_ok=True)
+    dances = load_dances(args["dances_folder"])
+    synthesize_motion(dances, args)
