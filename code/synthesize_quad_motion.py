@@ -8,7 +8,9 @@ from scipy.spatial.transform import Rotation as R
 
 Hip_index = read_bvh.joint_index['hip']
 
-Joints_num = 56  # Should match training (227 = 3 + 56*4)
+# Make sure Joints_num + 1 (hip) = 57 if needed, or 56 if correct
+# 3 + (56*4) = 227
+Joints_num = 56
 In_frame_size = 227
 Hidden_size = 1024
 
@@ -25,8 +27,8 @@ class acLSTM(nn.Module):
         self.decoder = nn.Linear(hidden_size, out_frame_size)
 
     def init_hidden(self, batch):
-        return [torch.zeros(batch, self.hidden_size).cuda() for _ in range(3)], \
-               [torch.zeros(batch, self.hidden_size).cuda() for _ in range(3)]
+        return ([torch.zeros(batch, self.hidden_size).cuda() for _ in range(3)],
+                [torch.zeros(batch, self.hidden_size).cuda() for _ in range(3)])
 
     def forward_lstm(self, in_frame, vec_h, vec_c):
         h0, c0 = self.lstm1(in_frame, (vec_h[0], vec_c[0]))
@@ -41,17 +43,18 @@ class acLSTM(nn.Module):
         out_seq = torch.zeros(batch, 0).cuda()
         out_frame = torch.zeros(batch, self.out_frame_size).cuda()
 
+        # Use initial sequence
         for i in range(initial_seq.size(1)):
             in_frame = initial_seq[:, i]
             out_frame, vec_h, vec_c = self.forward_lstm(in_frame, vec_h, vec_c)
             out_seq = torch.cat((out_seq, out_frame), dim=1)
 
+        # Generate extra frames
         for _ in range(generate_frames_number):
             in_frame = out_frame
             out_frame, vec_h, vec_c = self.forward_lstm(in_frame, vec_h, vec_c)
 
-            # Normalize quaternion part of the output
-            # This ensures model predictions always produce valid unit quaternions
+            # Normalize quaternion portion
             B = out_frame.size(0)
             F = self.out_frame_size
             root_dim = 3
@@ -72,6 +75,7 @@ def load_dances(folder):
     return [np.load(os.path.join(folder, f)) for f in os.listdir(folder) if f.endswith(".npy")]
 
 def get_dance_len_lst(dances):
+    # e.g., repeat each dance 10 times
     return [i for i in range(len(dances)) for _ in range(10)]
 
 def generate_seq(initial_seq_np, generate_frames_number, model, save_folder):
@@ -81,46 +85,24 @@ def generate_seq(initial_seq_np, generate_frames_number, model, save_folder):
     for b in range(out_tensor.size(0)):
         seq = out_tensor[b].detach().cpu().numpy().reshape(-1, In_frame_size)
 
-        # Diagnostic information - helpful for debugging
-        print(f"First frame root: {seq[0, :3]}")
-        print(f"First frame quaternion norms: {np.linalg.norm(seq[0, 3:].reshape(-1, 4), axis=1)}")
-
-        # Clamp root translation to reasonable values
+        # Clamp root translation
         root = np.clip(seq[:, :3], -2, 2)
-
-        # Handle quaternions with extra care
         quats = seq[:, 3:].reshape(seq.shape[0], -1, 4)
 
-        # Check for and handle near-zero quaternions
-        quats_norm = np.linalg.norm(quats, axis=-1, keepdims=True)
-        min_norm = 1e-2  # Minimum acceptable norm
-
-        # Create a mask for quaternions with small norms
-        small_norm_mask = quats_norm < min_norm
-
-        # Replace small norm quaternions with identity quaternion [1,0,0,0]
+        # Replace very small norms with identity
+        norms = np.linalg.norm(quats, axis=-1, keepdims=True)
+        min_norm = 1e-2
         identity_quat = np.array([1.0, 0.0, 0.0, 0.0])
-        for i in range(quats.shape[0]):
-            for j in range(quats.shape[1]):
-                if quats_norm[i, j, 0] < min_norm:
-                    quats[i, j] = identity_quat
+        quats[norms[..., 0] < min_norm] = identity_quat
+        quats /= (np.linalg.norm(quats, axis=-1, keepdims=True) + 1e-8)
 
-        # Normalize all quaternions to unit length
-        quats = quats / (np.linalg.norm(quats, axis=-1, keepdims=True) + 1e-8)
-
-        # Reshape for conversion
-        num_frames = quats.shape[0]
-        num_joints = quats.shape[1]
+        # Convert quats -> Euler
         quats_flat = quats.reshape(-1, 4)
-
-        # Convert to Euler angles for BVH
         eulers_flat = R.from_quat(quats_flat).as_euler('zxy', degrees=True)
-        eulers = eulers_flat.reshape(num_frames, num_joints * 3)
+        eulers = eulers_flat.reshape(quats.shape[0], quats.shape[1] * 3)
 
-        # Combine root and joint rotations
+        # Combine root translations + Euler rotations
         bvh_data = np.concatenate([root, eulers], axis=1)
-
-        # Write to BVH file
         read_bvh.write_traindata_to_bvh(os.path.join(save_folder, f"out{b:02d}.bvh"), bvh_data)
 
 def synthesize_motion(dances, args):
@@ -144,9 +126,9 @@ def synthesize_motion(dances, args):
 
 # === Settings ===
 args = {
-    "model_weights": "C:/Users/alexa/Desktop/MAI645_Team_04/results_quad_weights_v4/0007000.weight",
+    "model_weights": "C:/Users/alexa/Desktop/MAI645_Team_04/results_quad_weights_v5/0000000.weight",
     "dances_folder": "C:/Users/alexa/Desktop/MAI645_Team_04/train_data_quad/martial/",
-    "output_dir": "C:/Users/alexa/Desktop/result_quat_fourth/",
+    "output_dir": "C:/Users/alexa/Desktop/result_quat_six/",
     "frame_rate": 60,
     "batch": 5,
     "initial_seq_len": 15,

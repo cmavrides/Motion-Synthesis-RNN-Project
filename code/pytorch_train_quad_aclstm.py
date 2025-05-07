@@ -9,28 +9,95 @@ import argparse
 
 Hip_index = read_bvh.joint_index['hip']
 
-Seq_len = 100
+Seq_len=100
 Hidden_size = 1024
-Joints_num = 56  # 56 joints for quaternion data
-Condition_num = 5
-Groundtruth_num = 5
-In_frame_size = 227  # 3 root + 56*4 quaternion values
+Condition_num=5
+Groundtruth_num=5
+
+# Replace 171 with 227 wherever you define your frame sizes:
+Joints_num = 57
+# If each joint now uses quaternion (4 values) plus possibly 3 for hips,
+# ensure you have the right total. Here we assume 3 + (57 * 4) = 231, or 227
+# if you have a specific layout. Adjust as needed:
+In_frame_size = 227
+
+
+def normalize_quaternions_torch(seq, root_dim=3):
+    """
+    seq shape: [batch, seq_len, frame_size]
+    Normalize each quaternion [w, x, y, z] without doing in-place slicing,
+    preserving gradient flows.
+    """
+    batch, seq_len, frame_size = seq.shape
+    quat_dim = frame_size - root_dim
+    joint_count = quat_dim // 4
+
+    # Flatten [batch, seq_len, frame_size], using reshape instead of view
+    seq_flat = seq.reshape(batch * seq_len, frame_size)
+
+    quats = seq_flat[:, root_dim:]  # shape: [batch*seq_len, quat_dim]
+    quats_reshaped = quats.reshape(-1, joint_count, 4)
+
+    # Compute norms and normalize
+    norms = quats_reshaped.norm(dim=2, keepdim=True) + 1e-8
+    quats_normalized = quats_reshaped / norms
+
+    # Rebuild a safe copy of the full sequence
+    out = seq.clone().reshape(batch * seq_len, frame_size)
+    out[:, root_dim:] = quats_normalized.reshape(batch * seq_len, quat_dim)
+
+    return out.reshape(batch, seq_len, frame_size)
+
+
+def normalize_quaternions(data_np):
+        """
+        data_np shape: (batch, seq_len, frame_size)
+        For each frame, the first root_dim values are translation,
+        and the rest are quaternions in groups of 4.
+        """
+        root_dim=3
+        batch, seq_len, frame_size = data_np.shape
+        quat_dim = frame_size - root_dim
+        joint_count = quat_dim // 4
+
+        for b in range(batch):
+            for t in range(seq_len):
+                for j in range(joint_count):
+                    # quaternion indices in [root_dim : ...]
+                    q_start = root_dim + j * 4
+                    q = data_np[b, t, q_start:q_start+4]
+                    norm = np.linalg.norm(q) + 1e-8
+                    data_np[b, t, q_start:q_start+4] = q / norm
+        return data_np
 
 
 class acLSTM(nn.Module):
     def __init__(self, in_frame_size=227, hidden_size=1024, out_frame_size=227):
         super(acLSTM, self).__init__()
-
         self.in_frame_size = in_frame_size
         self.hidden_size = hidden_size
         self.out_frame_size = out_frame_size
 
-        ##lstm#########################################################
-        self.lstm1 = nn.LSTMCell(self.in_frame_size, self.hidden_size)#param+ID
+        self.lstm1 = nn.LSTMCell(self.in_frame_size, self.hidden_size)
         self.lstm2 = nn.LSTMCell(self.hidden_size, self.hidden_size)
         self.lstm3 = nn.LSTMCell(self.hidden_size, self.hidden_size)
         self.decoder = nn.Linear(self.hidden_size, self.out_frame_size)
 
+
+    def calculate_quaternion_loss(self, out_seq, groundtruth_seq):
+            batch, total_dim = out_seq.shape
+            frame_size = 227
+            seq_len = total_dim // frame_size
+
+            out_seq_reshaped = out_seq.view(batch, seq_len, frame_size)
+            gt_seq_reshaped = groundtruth_seq.view(batch, seq_len, frame_size)
+
+            # Normalize quaternions in torch to maintain gradient flow
+            out_seq_norm = normalize_quaternions_torch(out_seq_reshaped)
+
+            loss_function = nn.MSELoss()
+            loss = loss_function(out_seq_norm, gt_seq_reshaped)
+            return loss
 
     #output: [batch*1024, batch*1024, batch*1024], [batch*1024, batch*1024, batch*1024]
     def init_hidden(self, batch):
@@ -53,7 +120,7 @@ class acLSTM(nn.Module):
         vec_h1,vec_c1=self.lstm2(vec_h[0], (vec_h[1],vec_c[1]))
         vec_h2,vec_c2=self.lstm3(vec_h[1], (vec_h[2],vec_c[2]))
 
-        out_frame = self.decoder(vec_h[2]) #out b*150
+        out_frame = self.decoder(vec_h2) #out b*150
         vec_h_new=[vec_h0, vec_h1, vec_h2]
         vec_c_new=[vec_c0, vec_c1, vec_c2]
 
@@ -101,104 +168,112 @@ class acLSTM(nn.Module):
     #cuda tensor out_seq batch*(seq_len*frame_size)
     #cuda tensor groundtruth_seq batch*(seq_len*frame_size)
     def calculate_loss(self, out_seq, groundtruth_seq):
-        B, TF = out_seq.shape
-        F = self.out_frame_size
-        T = TF // F
-        root_dim = 3
-        quat_dim = 4
-        J = (F - root_dim) // quat_dim
 
-        # Root translation loss (MSE)
-        pred_root = out_seq.view(B, T, F)[:, :, :root_dim]
-        true_root = groundtruth_seq.view(B, T, F)[:, :, :root_dim]
-        root_loss = torch.nn.functional.mse_loss(pred_root, true_root)
-
-        # Quaternion loss (geodesic)
-        pred_q = out_seq.view(B, T, F)[:, :, root_dim:].contiguous().view(B, T, J, quat_dim)
-        true_q = groundtruth_seq.view(B, T, F)[:, :, root_dim:].contiguous().view(B, T, J, quat_dim)
-
-        # Normalize quaternions
-        pred_q = pred_q / (pred_q.norm(dim=-1, keepdim=True) + 1e-8)
-        true_q = true_q / (true_q.norm(dim=-1, keepdim=True) + 1e-8)
-
-        # Geodesic loss (angle between quaternions)
-        dot = (pred_q * true_q).sum(dim=-1).abs().clamp(1e-6, 1.0 - 1e-6)
-        quat_loss = 2.0 * torch.acos(dot)
-        quat_loss = quat_loss.mean()
-
-        # Add small regularization for quaternion norm
-        norm_loss = ((pred_q.norm(dim=-1) - 1.0) ** 2).mean() * 0.1
-
-        return root_loss + quat_loss + norm_loss
+        loss_function = nn.MSELoss()
+        loss = loss_function(out_seq, groundtruth_seq)
+        return loss
 
 
 #numpy array real_seq_np: batch*seq_len*frame_size
 def train_one_iteraton(real_seq_np, model, optimizer, iteration, save_dance_folder, print_loss=False, save_bvh_motion=True):
-    real_seq = torch.autograd.Variable(torch.FloatTensor(real_seq_np).cuda())
-    seq_len = real_seq.size()[1]-1
+    # Example: handle quaternion data of 227 features
+    # Normalize quaternions in the input if needed
+    real_seq_np = normalize_quaternions(real_seq_np)
+
+    # ...existing difference-of-hip logic or remove if not needed for quaternions...
+    dif = real_seq_np[:, 1:real_seq_np.shape[1]] - real_seq_np[:, 0:real_seq_np.shape[1]-1]
+    real_seq_dif_hip_x_z_np = real_seq_np[:, 0:real_seq_np.shape[1]-1].copy()
+    # ...existing code that modifies the hip index...
+
+    real_seq = torch.autograd.Variable(torch.FloatTensor(real_seq_dif_hip_x_z_np.tolist()).cuda())
+
+    seq_len = real_seq.size()[1] - 1
     in_real_seq = real_seq[:, 0:seq_len]
-    predict_groundtruth_seq = real_seq[:, 1:seq_len+1].contiguous().view(real_seq_np.shape[0], -1)
+
+    predict_groundtruth_seq = torch.autograd.Variable(
+        torch.FloatTensor(real_seq_dif_hip_x_z_np[:, 1:seq_len+1].tolist())
+    ).cuda().view(real_seq_np.shape[0], -1)
+
     predict_seq = model.forward(in_real_seq, Condition_num, Groundtruth_num)
 
-    # Normalize quaternion part of output
-    with torch.no_grad():
-        B, TF = predict_seq.shape
-        F = In_frame_size
-        T = TF // F
-        root_dim = 3
-        quat_dim = 4
-        J = (F - root_dim) // quat_dim
-        pred_seq_reshaped = predict_seq.view(B, T, F)
-        quats = pred_seq_reshaped[:, :, root_dim:].contiguous().view(B, T, J, quat_dim)
-        quats = quats / (quats.norm(dim=-1, keepdim=True) + 1e-8)
-        pred_seq_reshaped[:, :, root_dim:] = quats.view(B, T, J * quat_dim)
-        predict_seq = pred_seq_reshaped.view(B, T * F)
-
     optimizer.zero_grad()
-    loss = model.calculate_loss(predict_seq, predict_groundtruth_seq)
+
+    # Use our quaternion loss
+    loss = model.calculate_quaternion_loss(predict_seq, predict_groundtruth_seq)
+
     loss.backward()
     optimizer.step()
 
     if print_loss:
-        print("########### iter %07d ######################" % iteration)
-        print("loss: " + str(loss.detach().cpu().numpy()))
+        print("###########iter %07d######################" % iteration)
+        print("loss:", loss.detach().cpu().numpy())
 
-    if save_bvh_motion:
-        gt_seq = predict_groundtruth_seq[0].detach().cpu().numpy().reshape(-1, In_frame_size)
-        out_seq = predict_seq[0].detach().cpu().numpy().reshape(-1, In_frame_size)
-        read_bvh.write_traindata_to_bvh(os.path.join(save_dance_folder, "%07d_gt.bvh" % iteration), gt_seq)
-        read_bvh.write_traindata_to_bvh(os.path.join(save_dance_folder, "%07d_out.bvh" % iteration), out_seq)
 
-# Rest of the code unchanged
+    if(save_bvh_motion==True):
+        ##save the first motion sequence int the batch.
+        gt_seq = np.array(predict_groundtruth_seq[0].data.tolist()).reshape(-1,In_frame_size)
+        last_x = 0.0
+        last_z = 0.0
+        # Change hip xyz previous hip location for ground truth sequence
+        for frame in range(gt_seq.shape[0]):
+            gt_seq[frame,Hip_index*3]=gt_seq[frame,Hip_index*3]+last_x
+            last_x=gt_seq[frame,Hip_index*3]
+
+            gt_seq[frame,Hip_index*3+2]=gt_seq[frame,Hip_index*3+2]+last_z
+            last_z=gt_seq[frame,Hip_index*3+2]
+
+        out_seq=np.array(predict_seq[0].data.tolist()).reshape(-1,In_frame_size)
+        last_x=0.0
+        last_z=0.0
+        # Change hip xyz based on previous hip locations for out seq
+        for frame in range(out_seq.shape[0]):
+            out_seq[frame,Hip_index*3]=out_seq[frame,Hip_index*3]+last_x
+            last_x=out_seq[frame,Hip_index*3]
+
+            out_seq[frame,Hip_index*3+2]=out_seq[frame,Hip_index*3+2]+last_z
+            last_z=out_seq[frame,Hip_index*3+2]
+
+        read_bvh.write_traindata_to_bvh(save_dance_folder+"%07d"%iteration+"_gt.bvh", gt_seq)
+        read_bvh.write_traindata_to_bvh(save_dance_folder+"%07d"%iteration+"_out.bvh", out_seq)
+
+#input a list of dances [dance1, dance2, dance3]
+#return a list of dance index, the occurence number of a dance's index is proportional to the length of the dance
 def get_dance_len_lst(dances):
-    len_lst = []
+    len_lst=[]
     for dance in dances:
+        #length=len(dance)/100
         length = 10
-        if length < 1:
-            length = 1
-        len_lst = len_lst + [length]
-    index_lst = []
-    index = 0
+        if(length<1):
+            length=1
+        len_lst=len_lst+[length]
+
+    index_lst=[]
+    index=0
     for length in len_lst:
         for i in range(length):
-            index_lst = index_lst + [index]
-        index = index + 1
+            index_lst=index_lst+[index]
+        index=index+1
     return index_lst
 
+#input dance_folder name
+#output a list of dances.
 def load_dances(dance_folder):
-    dance_files = os.listdir(dance_folder)
-    dances = []
+    dance_files=os.listdir(dance_folder)
+    dances=[]
     print('Loading motion files...')
     for dance_file in dance_files:
-        dance = np.load(os.path.join(dance_folder, dance_file))
-        dances = dances + [dance]
+        # print ("load "+dance_file)
+        dance=np.load(dance_folder+dance_file)
+        dances=dances+[dance]
     print(len(dances), ' Motion files loaded')
+
     return dances
 
+# dances: [dance1, dance2, dance3,....]
 def train(dances, frame_rate, batch, seq_len, read_weight_path, write_weight_folder,
           write_bvh_motion_folder, in_frame, out_frame, hidden_size=1024, total_iter=500000):
 
-    seq_len = seq_len+2
+    seq_len=seq_len+2
     torch.cuda.set_device(0)
 
     model = acLSTM(in_frame_size=in_frame, hidden_size=hidden_size, out_frame_size=out_frame)
@@ -229,6 +304,7 @@ def train(dances, frame_rate, batch, seq_len, read_weight_path, write_weight_fol
             dance=dances[dance_id].copy()
             dance_len = dance.shape[0]
 
+# Line 240 in the train function:
             start_id = random.randint(10, int(dance_len-seq_len*speed-10))
             sample_seq=[]
             for i in range(seq_len):
