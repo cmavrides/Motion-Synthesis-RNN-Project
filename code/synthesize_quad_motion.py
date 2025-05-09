@@ -1,141 +1,196 @@
 import os
+import random
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
-import random
-import read_bvh
 from scipy.spatial.transform import Rotation as R
 
-Hip_index = read_bvh.joint_index['hip']
+import read_bvh
 
-# Make sure Joints_num + 1 (hip) = 57 if needed, or 56 if correct
-# 3 + (56*4) = 227
-Joints_num = 56
-In_frame_size = 227
-Hidden_size = 1024
+# =============================================================================
+#  HARD‑CODED CONFIGURATION ----------------------------------------------------
+# =============================================================================
+
+MODEL_WEIGHTS   = r"C:/Users/alexa/Desktop/MAI645_Team_04/results_quad_weights_v7/0024000.weight"
+DANCES_FOLDER   = r"C:/Users/alexa/Desktop/MAI645_Team_04/train_data_quad/martial/"
+OUTPUT_FOLDER   = r"C:/Users/alexa/Desktop/result_quat_v7/"
+FRAME_RATE      = 60      # source data fps
+BATCH_SIZE      = 5
+WARMUP_LEN      = 15      # initial ground‑truth frames
+GENERATE_FRAMES = 400     # frames to generate after warm‑up
+
+# =============================================================================
+#  CONSTANTS ------------------------------------------------------------------
+# =============================================================================
+
+HIP_INDEX   = read_bvh.joint_index["hip"]   # index of hip joint
+FRAME_SIZE  = 227                            # 3 root xyz + 56 × 4‑dim quats
+HIDDEN_SIZE = 1024
+
+# =============================================================================
+#  Quaternion helpers ---------------------------------------------------------
+# =============================================================================
+
+def normalize_quaternions_numpy(arr: np.ndarray, root_dim: int = 3) -> np.ndarray:
+    """Normalise every quaternion in *arr* (x, y, z, w ordering)."""
+    out = arr.copy()
+    quat_flat = out[..., root_dim:]
+    joint_cnt = quat_flat.shape[-1] // 4
+    quats = quat_flat.reshape(-1, joint_cnt, 4)
+    norms = np.linalg.norm(quats, axis=2, keepdims=True) + 1e-8
+    quats /= norms
+    out[..., root_dim:] = quats.reshape(quat_flat.shape)
+    return out
+
+# =============================================================================
+#  BVH ⇆ Quaternion conversion ------------------------------------------------
+# =============================================================================
+
+def generate_bvh_from_quad_traindata(npy_path: str, bvh_path: str):
+    """Decode quaternion motion (227‑D) back to BVH using the reference skeleton."""
+    quat_data = np.load(npy_path)
+    euler_frames = []
+    for frame in quat_data:
+        root = frame[:3]
+        quats = frame[3:].reshape(-1, 4)
+        quats /= (np.linalg.norm(quats, axis=1, keepdims=True) + 1e-8)
+        eulers = R.from_quat(quats).as_euler("zxy", degrees=True)
+        euler_frames.append(np.concatenate([root, eulers.flatten()]))
+    read_bvh.write_traindata_to_bvh(bvh_path, np.asarray(euler_frames))
+
+# =============================================================================
+#  acLSTM model ---------------------------------------------------------------
+# =============================================================================
 
 class acLSTM(nn.Module):
-    def __init__(self, in_frame_size=227, hidden_size=1024, out_frame_size=227):
-        super(acLSTM, self).__init__()
-        self.in_frame_size = in_frame_size
-        self.hidden_size = hidden_size
-        self.out_frame_size = out_frame_size
+    """Three‑layer LSTM decoder, matching the training architecture."""
 
+    def __init__(self, in_frame_size: int = FRAME_SIZE, hidden_size: int = HIDDEN_SIZE,
+                 out_frame_size: int = FRAME_SIZE):
+        super().__init__()
+        self.hidden_size = hidden_size
         self.lstm1 = nn.LSTMCell(in_frame_size, hidden_size)
         self.lstm2 = nn.LSTMCell(hidden_size, hidden_size)
         self.lstm3 = nn.LSTMCell(hidden_size, hidden_size)
         self.decoder = nn.Linear(hidden_size, out_frame_size)
 
-    def init_hidden(self, batch):
-        return ([torch.zeros(batch, self.hidden_size).cuda() for _ in range(3)],
-                [torch.zeros(batch, self.hidden_size).cuda() for _ in range(3)])
+    # ------------------------------------------------------------------
+    def init_hidden(self, batch: int, device: torch.device):
+        z = torch.zeros(batch, self.hidden_size, device=device)
+        return ([z.clone(), z.clone(), z.clone()], [z.clone(), z.clone(), z.clone()])
 
-    def forward_lstm(self, in_frame, vec_h, vec_c):
-        h0, c0 = self.lstm1(in_frame, (vec_h[0], vec_c[0]))
-        h1, c1 = self.lstm2(h0, (vec_h[1], vec_c[1]))
-        h2, c2 = self.lstm3(h1, (vec_h[2], vec_c[2]))
-        out = self.decoder(h2)
-        return out, [h0, h1, h2], [c0, c1, c2]
+    # ------------------------------------------------------------------
+    def forward_lstm(self, x, h, c):
+        h0, c0 = self.lstm1(x, (h[0], c[0]))
+        h1, c1 = self.lstm2(h0, (h[1], c[1]))
+        h2, c2 = self.lstm3(h1, (h[2], c[2]))
+        return self.decoder(h2), [h0, h1, h2], [c0, c1, c2]
 
-    def forward(self, initial_seq, generate_frames_number):
-        batch = initial_seq.size(0)
-        vec_h, vec_c = self.init_hidden(batch)
-        out_seq = torch.zeros(batch, 0).cuda()
-        out_frame = torch.zeros(batch, self.out_frame_size).cuda()
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def sample(self, warmup: torch.Tensor, gen_frames: int):
+        """Autoregressively continue *warmup* for *gen_frames* steps."""
+        device = warmup.device
+        batch = warmup.shape[0]
+        h, c = self.init_hidden(batch, device)
+        outputs = []
+        cur = None
+        for t in range(warmup.shape[1]):
+            cur, h, c = self.forward_lstm(warmup[:, t], h, c)
+            outputs.append(cur)
+        for _ in range(gen_frames):
+            cur, h, c = self.forward_lstm(cur, h, c)
+            outputs.append(cur)
+        return torch.stack(outputs, dim=1)   # (B, W-1+G, 227)
 
-        # Use initial sequence
-        for i in range(initial_seq.size(1)):
-            in_frame = initial_seq[:, i]
-            out_frame, vec_h, vec_c = self.forward_lstm(in_frame, vec_h, vec_c)
-            out_seq = torch.cat((out_seq, out_frame), dim=1)
+# =============================================================================
+#  Data helpers ---------------------------------------------------------------
+# =============================================================================
 
-        # Generate extra frames
-        for _ in range(generate_frames_number):
-            in_frame = out_frame
-            out_frame, vec_h, vec_c = self.forward_lstm(in_frame, vec_h, vec_c)
+def load_dances(folder: str):
+    dances = [np.load(os.path.join(folder, f)) for f in os.listdir(folder) if f.endswith(".npy")]
+    if not dances:
+        raise RuntimeError("No .npy files in " + folder)
+    print(f"Loaded {len(dances)} motion files from {folder}")
+    return dances
 
-            # Normalize quaternion portion
-            B = out_frame.size(0)
-            F = self.out_frame_size
-            root_dim = 3
-            quat_dim = 4
-            J = (F - root_dim) // quat_dim
+def sampling_pool(dances):
+    pool = []
+    for idx, d in enumerate(dances):
+        pool.extend([idx] * max(int(len(d) / 100), 1))
+    return pool
 
-            out_frame_view = out_frame.view(B, F)
-            quats = out_frame_view[:, root_dim:].view(B, J, quat_dim)
-            quats = quats / (quats.norm(dim=-1, keepdim=True) + 1e-8)
-            out_frame_view[:, root_dim:] = quats.view(B, J * quat_dim)
+# =============================================================================
+#  Generation -----------------------------------------------------------------
+# =============================================================================
 
-            out_seq = torch.cat((out_seq, out_frame), dim=1)
+def generate_batch(model: acLSTM, dances: list[np.ndarray], batch_size: int,
+                   warmup_len: int, gen_frames: int, frame_rate: int,
+                   save_dir: str, device: torch.device):
+    if not os.path.isdir(save_dir):
+        os.makedirs(save_dir)
 
-        return out_seq
+    pool  = sampling_pool(dances)
+    speed = frame_rate / 30.0  # network operates at 30 fps
 
-def load_dances(folder):
-    print("Loading quad .npy sequences...")
-    return [np.load(os.path.join(folder, f)) for f in os.listdir(folder) if f.endswith(".npy")]
+    # ------------------------------------------------------------------
+    #  Build warm‑up batch (absolute coords)
+    # ------------------------------------------------------------------
+    warmups_abs = []
+    for _ in range(batch_size):
+        dance = dances[random.choice(pool)]
+        start = random.randint(10, int(len(dance) - warmup_len * speed - 10))
+        warmups_abs.append([dance[int(start + i * speed)] for i in range(warmup_len)])
+    warmups_abs = np.asarray(warmups_abs)                      # (B, W, 227)
 
-def get_dance_len_lst(dances):
-    # e.g., repeat each dance 10 times
-    return [i for i in range(len(dances)) for _ in range(10)]
+    # ------------------------------------------------------------------
+    #  Derivative coding on root X/Z only (mirror of training)
+    # ------------------------------------------------------------------
+    dxz = warmups_abs[:, 1:, :3] - warmups_abs[:, :-1, :3]
+    warmups_dif = warmups_abs[:, :-1].copy()
+    warmups_dif[:, :, 0] = dxz[:, :, 0]
+    warmups_dif[:, :, 2] = dxz[:, :, 2]
 
-def generate_seq(initial_seq_np, generate_frames_number, model, save_folder):
-    initial_seq_tensor = torch.tensor(initial_seq_np, dtype=torch.float32).cuda()
-    out_tensor = model(initial_seq_tensor, generate_frames_number)
+    warmups_t = torch.tensor(warmups_dif, dtype=torch.float32, device=device)
 
-    for b in range(out_tensor.size(0)):
-        seq = out_tensor[b].detach().cpu().numpy().reshape(-1, In_frame_size)
-
-        # Clamp root translation
-        root = np.clip(seq[:, :3], -2, 2)
-        quats = seq[:, 3:].reshape(seq.shape[0], -1, 4)
-
-        # Replace very small norms with identity
-        norms = np.linalg.norm(quats, axis=-1, keepdims=True)
-        min_norm = 1e-2
-        identity_quat = np.array([1.0, 0.0, 0.0, 0.0])
-        quats[norms[..., 0] < min_norm] = identity_quat
-        quats /= (np.linalg.norm(quats, axis=-1, keepdims=True) + 1e-8)
-
-        # Convert quats -> Euler
-        quats_flat = quats.reshape(-1, 4)
-        eulers_flat = R.from_quat(quats_flat).as_euler('zxy', degrees=True)
-        eulers = eulers_flat.reshape(quats.shape[0], quats.shape[1] * 3)
-
-        # Combine root translations + Euler rotations
-        bvh_data = np.concatenate([root, eulers], axis=1)
-        read_bvh.write_traindata_to_bvh(os.path.join(save_folder, f"out{b:02d}.bvh"), bvh_data)
-
-def synthesize_motion(dances, args):
-    model = acLSTM(In_frame_size, Hidden_size, In_frame_size).cuda()
-    model.load_state_dict(torch.load(args["model_weights"]))
+    # ------------------------------------------------------------------
+    #  Inference
+    # ------------------------------------------------------------------
     model.eval()
+    pred = model.sample(warmups_t, gen_frames)                 # (B, W-1+G, 227)
+    pred_np = pred.cpu().numpy()
 
-    len_lst = get_dance_len_lst(dances)
-    speed = args["frame_rate"] / 30
-    batch_data = []
+    # ------------------------------------------------------------------
+    #  Re‑integrate root translation
+    # ------------------------------------------------------------------
+    for b in range(batch_size):
+        seq = pred_np[b]
+        # Start accumulation from *first* warm‑up frame so there is no jump
+        last_x = warmups_abs[b, 0, 0]
+        last_z = warmups_abs[b, 0, 2]
+        for f in range(seq.shape[0]):
+            seq[f, 0] += last_x; last_x = seq[f, 0]
+            seq[f, 2] += last_z; last_z = seq[f, 2]
+        seq = normalize_quaternions_numpy(seq)
 
-    for _ in range(args["batch"]):
-        idx = random.choice(len_lst)
-        dance = dances[idx]
-        start = random.randint(10, int(len(dance) - args["initial_seq_len"] * speed - 10))
-        sequence = [dance[int(start + i * speed)] for i in range(args["initial_seq_len"])]
-        batch_data.append(sequence)
+        tmp_npy = os.path.join(save_dir, f"sample{b:02d}.npy")
+        out_bvh = os.path.join(save_dir, f"sample{b:02d}.bvh")
+        np.save(tmp_npy, seq)
+        generate_bvh_from_quad_traindata(tmp_npy, out_bvh)
+        os.remove(tmp_npy)
+    print(f"Saved {batch_size} BVH files to {save_dir}")
 
-    batch_np = np.array(batch_data)
-    generate_seq(batch_np, args["generate_frames"], model, args["output_dir"])
+# =============================================================================
+#  Main -----------------------------------------------------------------------
+# =============================================================================
 
-# === Settings ===
-args = {
-    "model_weights": "C:/Users/alexa/Desktop/MAI645_Team_04/results_quad_weights_v5/0000000.weight",
-    "dances_folder": "C:/Users/alexa/Desktop/MAI645_Team_04/train_data_quad/martial/",
-    "output_dir": "C:/Users/alexa/Desktop/result_quat_six/",
-    "frame_rate": 60,
-    "batch": 5,
-    "initial_seq_len": 15,
-    "generate_frames": 400
-}
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dances = load_dances(DANCES_FOLDER)
+    model = acLSTM().to(device)
+    model.load_state_dict(torch.load(MODEL_WEIGHTS, map_location=device))
+    generate_batch(model, dances, BATCH_SIZE, WARMUP_LEN, GENERATE_FRAMES,
+                   FRAME_RATE, OUTPUT_FOLDER, device)
 
 if __name__ == "__main__":
-    os.makedirs(args["output_dir"], exist_ok=True)
-    dances = load_dances(args["dances_folder"])
-    synthesize_motion(dances, args)
+    main()
