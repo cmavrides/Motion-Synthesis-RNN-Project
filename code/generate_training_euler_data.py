@@ -9,7 +9,7 @@ WEIGHT_TRANSLATION = 0.01  # scale for translation channels
 ANGLE_SCALE = 180.0        # maximum absolute Euler angle in degrees
 
 # Standard BVH template (for write_frames) and its param count
-STANDARD_BVH_FILE = "train_data_bvh/standard.bvh"
+STANDARD_BVH_FILE = "../train_data_bvh/standard.bvh"
 # Load once to get expected raw parameter count
 _template = read_bvh.parse_frames(STANDARD_BVH_FILE)
 EXPECTED_PARAMS = _template.shape[1]

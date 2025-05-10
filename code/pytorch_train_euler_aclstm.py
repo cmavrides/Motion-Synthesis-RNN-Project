@@ -23,7 +23,7 @@ In_frame_size = Joints_num * 3
 FEATURE_DIM = 171
 WEIGHT_TRANSLATION = 0.01
 ANGLE_SCALE = 180.0
-STANDARD_BVH_FILE = "/kaggle/input/mai645project/MAI645_Team_04-main/train_data_bvh/standard.bvh"
+STANDARD_BVH_FILE = "..//train_data_bvh/standard.bvh"
 _template = read_bvh.parse_frames(STANDARD_BVH_FILE)
 EXPECTED_PARAMS = _template.shape[1]
 
@@ -91,75 +91,94 @@ class acLSTM(nn.Module):
         return out_seq[:, 1:]
 
     def calculate_loss(self, out_seq, groundtruth_seq):
-        # 1) diff in degrees, wrapped to [-180,180]
+        """
+        Angle-distance loss:
+          cos_error = cos(Δθ)
+          AD = sum_i (1 - cos_error_i)
+        and Δθ must be in radians.
+        """
+        # Δ in normalized units
         diff = out_seq - groundtruth_seq
-        diff = (diff + 180.0) % 360.0 - 180.0
-        # 2) convert to radians
-        #diff = diff * (math.pi / 180.0)
-        # 3) smooth L1 in radians
-        return torch.nn.functional.smooth_l1_loss(diff, torch.zeros_like(diff))
+        # convert normalized diff to radians: normalized angles ([-1,1]) × π → [−π,π]
+        rad_diff = diff * math.pi
+        cos_error = torch.cos(rad_diff)
+        # sum over all elements in the batch
+        loss = torch.sum(1.0 - cos_error)
+        return loss
 
 
-def train_one_iteraton(real_seq_np, model, optimizer, iteration,
-                       save_dance_folder, print_loss=False, save_bvh_motion=True):
-    # Prepare sequence with hip‐x/z differences
+Hip = read_bvh.joint_index['hip']
+
+def train_one_iteraton(real_seq_np,
+                       model,
+                       optimizer,
+                       iteration,
+                       save_dance_folder,
+                       print_loss=False,
+                       save_bvh_motion=True):
+    """
+    real_seq_np: (B, T, F) numpy, in normalized space [trans*WEIGHT, angles/ANGLE_SCALE]
+    model: acLSTM with your new calculate_loss
+    """
+
+    # 1) build “difference” version of hip‐x/z
     dif = real_seq_np[:, 1:] - real_seq_np[:, :-1]
-    seq_minus = real_seq_np[:, :-1].copy()
-    seq_minus[:, :, Hip_index*3]     = dif[:, :, Hip_index*3]
-    seq_minus[:, :, Hip_index*3 + 2] = dif[:, :, Hip_index*3 + 2]
+    seq_np = real_seq_np[:, :-1].copy()
+    seq_np[:, :, Hip*3    ] = dif[:, :, Hip*3    ]
+    seq_np[:, :, Hip*3 + 2] = dif[:, :, Hip*3 + 2]
 
-    real_seq = Variable(torch.FloatTensor(seq_minus).cuda())
-    seq_len = real_seq.size(1) - 1
-    in_real_seq = real_seq[:, :seq_len]
+    # 2) to torch
+    real_seq = torch.FloatTensor(seq_np).cuda()
+    T = real_seq.size(1)
+    in_seq  = real_seq[:, :T-1]
+    gt_seq  = real_seq[:, 1:T].contiguous().view(seq_np.shape[0], -1)
 
-    gt_seq_np = seq_minus[:, 1:seq_len+1]
-    predict_groundtruth_seq = Variable(
-        torch.FloatTensor(gt_seq_np.reshape(gt_seq_np.shape[0], -1)).cuda()
-    )
-
-    predict_seq = model.forward(in_real_seq, Condition_num, Groundtruth_num)
-
+    # 3) forward + loss + backward
+    pred_seq = model(in_seq)
     optimizer.zero_grad()
-    loss = model.calculate_loss(predict_seq, predict_groundtruth_seq)
+    loss = model.calculate_loss(pred_seq, gt_seq)
     loss.backward()
     optimizer.step()
 
     if print_loss:
-        print(f"########### iter {iteration:07d} ######################")
-        print(f"loss: {loss.item()}")
+        print(f"iter {iteration:07d}  loss {loss.item():.6f}")
 
+    # 4) optionally write out GT & pred as BVH
     if save_bvh_motion:
-        # reshape back to frames x features
-        gt_seq  = predict_groundtruth_seq[0].cpu().data.numpy().reshape(-1, FEATURE_DIM)
-        out_seq = predict_seq[0].cpu().data.numpy().reshape(-1, FEATURE_DIM)
+        # grab first batch element
+        gt_arr  = gt_seq[0].detach().cpu().numpy().reshape(-1, seq_np.shape[2])
+        out_arr = pred_seq[0].detach().cpu().numpy().reshape(-1, seq_np.shape[2])
 
-        # ——— Denormalize & write BVH exactly as in generate script ———
-        # 1) pad/truncate to FEATURE_DIM
-        gt_fixed  = _pad_or_truncate(gt_seq, FEATURE_DIM)
-        out_fixed = _pad_or_truncate(out_seq, FEATURE_DIM)
-        # 2) split translation / angles
-        gt_tn,  gt_an  = gt_fixed[:, :3],  gt_fixed[:, 3:]
-        out_tn, out_an = out_fixed[:, :3], out_fixed[:, 3:]
-        # 3) denormalize
-        gt_trans  = gt_tn  / WEIGHT_TRANSLATION
-        gt_angles = gt_an * ANGLE_SCALE
-        out_trans  = out_tn  / WEIGHT_TRANSLATION
-        out_angles = out_an * ANGLE_SCALE
-        # 4) recombine & pad to full BVH param count
-        raw_gt  = _pad_or_truncate(np.concatenate([gt_trans,  gt_angles], axis=1), EXPECTED_PARAMS)
-        raw_out = _pad_or_truncate(np.concatenate([out_trans, out_angles], axis=1), EXPECTED_PARAMS)
-        # 5) write with full hierarchy header
-        read_bvh.write_frames(
-            STANDARD_BVH_FILE,
-            os.path.join(save_dance_folder, f"{iteration:07d}_gt.bvh"),
-            raw_gt
-        )
-        read_bvh.write_frames(
-            STANDARD_BVH_FILE,
-            os.path.join(save_dance_folder, f"{iteration:07d}_out.bvh"),
-            raw_out
-        )
+        # unroll hip diffs back to absolute
+        def unroll_hip(arr):
+            last_x = last_z = 0.0
+            out = arr.copy()
+            for f in range(out.shape[0]):
+                out[f, Hip*3    ] += last_x
+                out[f, Hip*3 + 2] += last_z
+                last_x = out[f, Hip*3    ]
+                last_z = out[f, Hip*3 + 2]
+            return out
 
+        gt_arr  = unroll_hip(gt_arr)
+        out_arr = unroll_hip(out_arr)
+
+        # decode & write exactly as in generate_euler_training_data.py
+        for tag, seq in (("gt", gt_arr), ("out", out_arr)):
+            trans_norm  = seq[:, :3]
+            angles_norm = seq[:, 3:]
+            trans  = trans_norm  / WEIGHT_TRANSLATION
+            angles = angles_norm * ANGLE_SCALE
+            raw    = np.concatenate([trans, angles], axis=1)
+            raw_fixed = _pad_or_truncate(raw, EXPECTED_PARAMS)
+
+            out_bvh = os.path.join(
+                save_dance_folder,
+                f"{iteration:07d}_{tag}.bvh"
+            )
+            read_bvh.write_frames(STANDARD_BVH_FILE, out_bvh, raw_fixed)
+
+    return loss.item()
 
 def get_dance_len_lst(dances):
     len_lst = []
