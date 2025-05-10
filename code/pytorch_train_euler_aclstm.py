@@ -103,7 +103,7 @@ class acLSTM(nn.Module):
         rad_diff = diff * math.pi
         cos_error = torch.cos(rad_diff)
         # sum over all elements in the batch
-        loss = torch.sum(1.0 - cos_error)
+        loss = torch.mean(1.0 - cos_error)
         return loss
 
 
