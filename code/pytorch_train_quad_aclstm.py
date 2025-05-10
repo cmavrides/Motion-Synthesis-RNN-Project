@@ -6,100 +6,79 @@ import numpy as np
 import random
 import read_bvh
 import argparse
-import math
-from scipy.spatial.transform import Rotation as R
 
 Hip_index = read_bvh.joint_index['hip']
 
 Seq_len=100
 Hidden_size = 1024
-Joints_num = 19  # Assuming 19 joints for quaternion data (57/3 = 19 joints in positional)
+Joints_num =  57
 Condition_num=5
 Groundtruth_num=5
-In_frame_size = 227  # Updated for quaternion data
+In_frame_size = 227
 
 def normalize_quaternions_torch(seq, root_dim=3):
-    """
-    seq shape: [batch, seq_len, frame_size]
-    Normalize each quaternion [w, x, y, z] without doing in-place slicing,
-    preserving gradient flows.
-    """
-    batch, seq_len, frame_size = seq.shape
-    quat_dim = frame_size - root_dim
-    joint_count = quat_dim // 4
+        """
+        seq shape: [batch, seq_len, frame_size]
+        Normalize each quaternion [w, x, y, z] without doing in-place slicing,
+        preserving gradient flows.
+        """
+        batch, seq_len, frame_size = seq.shape
+        quat_dim = frame_size - root_dim
+        joint_count = quat_dim // 4
 
-    # Flatten [batch, seq_len, frame_size], using reshape instead of view
-    seq_flat = seq.reshape(batch * seq_len, frame_size)
+        # Flatten [batch, seq_len, frame_size], using reshape instead of view
+        seq_flat = seq.reshape(batch * seq_len, frame_size)
 
-    quats = seq_flat[:, root_dim:]  # shape: [batch*seq_len, quat_dim]
-    quats_reshaped = quats.reshape(-1, joint_count, 4)
+        quats = seq_flat[:, root_dim:]  # shape: [batch*seq_len, quat_dim]
+        quats_reshaped = quats.reshape(-1, joint_count, 4)
 
-    # Compute norms and normalize
-    norms = quats_reshaped.norm(dim=2, keepdim=True) + 1e-8
-    quats_normalized = quats_reshaped / norms
+        # Compute norms and normalize
+        norms = quats_reshaped.norm(dim=2, keepdim=True) + 1e-8
+        quats_normalized = quats_reshaped / norms
 
-    # Rebuild a safe copy of the full sequence
-    out = seq.clone().reshape(batch * seq_len, frame_size)
-    out[:, root_dim:] = quats_normalized.reshape(batch * seq_len, quat_dim)
+        # Rebuild a safe copy of the full sequence
+        out = seq.clone().reshape(batch * seq_len, frame_size)
+        out[:, root_dim:] = quats_normalized.reshape(batch * seq_len, quat_dim)
 
-    return out.reshape(batch, seq_len, frame_size)
-
+        return out.reshape(batch, seq_len, frame_size)
 
 
 def calculate_quaternion_loss(self, out_seq, groundtruth_seq):
-            batch, total_dim = out_seq.shape
-            frame_size = 227
-            seq_len = total_dim // frame_size
+                batch, total_dim = out_seq.shape
+                frame_size = 227
+                seq_len = total_dim // frame_size
 
-            out_seq_reshaped = out_seq.view(batch, seq_len, frame_size)
-            gt_seq_reshaped = groundtruth_seq.view(batch, seq_len, frame_size)
+                out_seq_reshaped = out_seq.view(batch, seq_len, frame_size)
+                gt_seq_reshaped = groundtruth_seq.view(batch, seq_len, frame_size)
 
-            # Normalize quaternions in torch to maintain gradient flow
-            out_seq_norm = normalize_quaternions_torch(out_seq_reshaped)
+                # Normalize quaternions in torch to maintain gradient flow
+                out_seq_norm = normalize_quaternions_torch(out_seq_reshaped)
 
-            loss_function = nn.MSELoss()
-            loss = loss_function(out_seq_norm, gt_seq_reshaped)
-            return loss
+                loss_function = nn.MSELoss()
+                loss = loss_function(out_seq_norm, gt_seq_reshaped)
+                return loss
 
+def generate_bvh_from_quad_traindata(src_train_folder, tar_bvh_folder):
+    if not os.path.exists(tar_bvh_folder):
+        os.makedirs(tar_bvh_folder)
 
-
-# Update the BVH generation function to handle quaternions properly
-def generate_bvh_from_quad_traindata(npy_file_path, bvh_output_path):
-    """Convert quaternion data (.npy) to BVH format"""
-    quat_data = np.load(npy_file_path)
-    # Convert quaternions back to Euler angles for BVH
-    euler_data = []
-    for frame in quat_data:
-        root = frame[:3]  # First 3 values are root translation
-        quats = frame[3:].reshape(-1, 4)  # Rest are quaternions, reshape to (num_joints, 4)
-
-        # Normalize quaternions
-        quats_norm = quats / (np.linalg.norm(quats, axis=1, keepdims=True) + 1e-8)
-
-        # Convert each joint's quaternion to Euler angles (BVH is usually ZXY order)
-        eulers = R.from_quat(quats_norm).as_euler('zxy', degrees=True)  # shape: (num_joints, 3)
-        euler_frame = np.concatenate([root, eulers.flatten()])
-        euler_data.append(euler_frame)
-    euler_data = np.array(euler_data)
-    read_bvh.write_traindata_to_bvh(bvh_output_path, euler_data)
-    print(f"Reconstructed BVH from quaternion data saved: {bvh_output_path}")
-
-def generate_quad_traindata_from_bvh(bvh_file_path, npy_output_path):
-    """Convert BVH format to quaternion data (.npy)"""
-    train_data = read_bvh.get_train_data(bvh_file_path)  # shape: (frames, joints*3)
-    # Assume first 3 values are root translation, rest are Euler angles (in groups of 3)
-    quat_data = []
-    for frame in train_data:
-        root = frame[:3]
-        eulers = frame[3:].reshape(-1, 3)  # shape: (num_joints, 3)
-        # Convert each joint's Euler angles to quaternion (BVH is usually ZXY order)
-        quats = R.from_euler('zxy', eulers, degrees=True).as_quat()  # shape: (num_joints, 4)
-        # Store as [root, q1, q2, ...]
-        quat_frame = np.concatenate([root, quats.flatten()])
-        quat_data.append(quat_frame)
-    quat_data = np.array(quat_data)
-    np.save(npy_output_path, quat_data)
-    print(f"Saved quaternion training data: {npy_output_path}")
+    for filename in os.listdir(src_train_folder):
+        if filename.endswith(".npy"):
+            train_data_path = os.path.join(src_train_folder, filename)
+            quat_data = np.load(train_data_path)
+            # Convert quaternions back to Euler angles for BVH
+            euler_data = []
+            for frame in quat_data:
+                root = frame[:3]
+                quats = frame[3:].reshape(-1, 4)  # shape: (num_joints, 4)
+                # Convert each joint's quaternion to Euler angles (BVH is usually ZXY order)
+                eulers = R.from_quat(quats).as_euler('zxy', degrees=True)  # shape: (num_joints, 3)
+                euler_frame = np.concatenate([root, eulers.flatten()])
+                euler_data.append(euler_frame)
+            euler_data = np.array(euler_data)
+            bvh_out_path = os.path.join(tar_bvh_folder, filename.replace(".npy", ".bvh"))
+            read_bvh.write_traindata_to_bvh(bvh_out_path, euler_data)
+            print(f"Reconstructed BVH from quaternion data saved: {bvh_out_path}")
 
 
 class acLSTM(nn.Module):
@@ -138,7 +117,7 @@ class acLSTM(nn.Module):
         vec_h1,vec_c1=self.lstm2(vec_h[0], (vec_h[1],vec_c[1]))
         vec_h2,vec_c2=self.lstm3(vec_h[1], (vec_h[2],vec_c[2]))
 
-        out_frame = self.decoder(vec_h2) #out b*227
+        out_frame = self.decoder(vec_h2) #out b*150
         vec_h_new=[vec_h0, vec_h1, vec_h2]
         vec_c_new=[vec_c0, vec_c1, vec_c2]
 
@@ -183,9 +162,8 @@ class acLSTM(nn.Module):
 
         return out_seq[:, 1: out_seq.size()[1]]
 
-    # Quaternion Loss function
-    # q_pred and q_gt are batches of quaternions (b*seq_len*frame_size)
-    # Replace the acLSTM.calculate_loss method with this improved version
+    #cuda tensor out_seq batch*(seq_len*frame_size)
+    #cuda tensor groundtruth_seq batch*(seq_len*frame_size)
     def calculate_loss(self, out_seq, groundtruth_seq):
         batch, total_dim = out_seq.shape
         frame_size = self.out_frame_size
@@ -209,17 +187,18 @@ class acLSTM(nn.Module):
 
         return total_loss
 
+
 #numpy array real_seq_np: batch*seq_len*frame_size
 def train_one_iteraton(real_seq_np, model, optimizer, iteration, save_dance_folder, print_loss=False, save_bvh_motion=True):
 
-    # For quaternion data, we only need to calculate dx and dz for root translation (first 3 values)
+    # set hip_x and hip_z as the difference from the future frame to current frame
     # Subtract post (t+1) - t. Then, you will have the difference between each pose timestamp
-    dif = real_seq_np[:, 1:real_seq_np.shape[1], :3] - real_seq_np[:, 0:real_seq_np.shape[1]-1, :3]
+    dif = real_seq_np[:, 1:real_seq_np.shape[1]] - real_seq_np[:, 0: real_seq_np.shape[1]-1]
     real_seq_dif_hip_x_z_np = real_seq_np[:, 0:real_seq_np.shape[1]-1].copy()
 
-    # Replace the root x and z with difference values
-    real_seq_dif_hip_x_z_np[:,:,0] = dif[:,:,0]  # x component
-    real_seq_dif_hip_x_z_np[:,:,2] = dif[:,:,2]  # z component
+    # Replace the values with the difference of each step to the previus step
+    real_seq_dif_hip_x_z_np[:,:,Hip_index*3]=dif[:,:,Hip_index*3]
+    real_seq_dif_hip_x_z_np[:,:,Hip_index*3+2]=dif[:,:,Hip_index*3+2]
 
     real_seq = torch.autograd.Variable(torch.FloatTensor(real_seq_dif_hip_x_z_np.tolist()).cuda())
 
@@ -232,7 +211,7 @@ def train_one_iteraton(real_seq_np, model, optimizer, iteration, save_dance_fold
 
     optimizer.zero_grad()
 
-    # The loss function for quaternion representation
+    # The loss function needs to change for each representation
     loss = model.calculate_loss(predict_seq, predict_groundtruth_seq)
 
     loss.backward()
@@ -245,62 +224,36 @@ def train_one_iteraton(real_seq_np, model, optimizer, iteration, save_dance_fold
 
 
     if(save_bvh_motion==True):
-        ##save the first motion sequence in the batch
-        gt_seq = np.array(predict_groundtruth_seq[0].data.tolist()).reshape(-1, In_frame_size)
+        ##save the first motion sequence int the batch.
+        gt_seq = np.array(predict_groundtruth_seq[0].data.tolist()).reshape(-1,In_frame_size)
         last_x = 0.0
         last_z = 0.0
-
-        # Change hip xyz for ground truth sequence
+        # Change hip xyz previous hip location for ground truth sequence
         for frame in range(gt_seq.shape[0]):
-            gt_seq[frame, 0] = gt_seq[frame, 0] + last_x
-            last_x = gt_seq[frame, 0]
+            gt_seq[frame,Hip_index*3]=gt_seq[frame,Hip_index*3]+last_x
+            last_x=gt_seq[frame,Hip_index*3]
 
-            gt_seq[frame, 2] = gt_seq[frame, 2] + last_z
-            last_z = gt_seq[frame, 2]
+            gt_seq[frame,Hip_index*3+2]=gt_seq[frame,Hip_index*3+2]+last_z
+            last_z=gt_seq[frame,Hip_index*3+2]
 
-        out_seq = np.array(predict_seq[0].data.tolist()).reshape(-1, In_frame_size)
-        last_x = 0.0
-        last_z = 0.0
-
-        # Change hip xyz for output sequence
+        out_seq=np.array(predict_seq[0].data.tolist()).reshape(-1,In_frame_size)
+        last_x=0.0
+        last_z=0.0
+        # Change hip xyz based on previous hip locations for out seq
         for frame in range(out_seq.shape[0]):
-            out_seq[frame, 0] = out_seq[frame, 0] + last_x
-            last_x = out_seq[frame, 0]
+            out_seq[frame,Hip_index*3]=out_seq[frame,Hip_index*3]+last_x
+            last_x=out_seq[frame,Hip_index*3]
 
-            out_seq[frame, 2] = out_seq[frame, 2] + last_z
-            last_z = out_seq[frame, 2]
+            out_seq[frame,Hip_index*3+2]=out_seq[frame,Hip_index*3+2]+last_z
+            last_z=out_seq[frame,Hip_index*3+2]
 
-        # Normalize the quaternions for both sequences
-        for frame in range(gt_seq.shape[0]):
-            for j in range((In_frame_size - 3) // 4):
-                idx = 3 + j * 4
-                quat = gt_seq[frame, idx:idx+4]
-                gt_seq[frame, idx:idx+4] = quat / (np.linalg.norm(quat) + 1e-8)
 
-        for frame in range(out_seq.shape[0]):
-            for j in range((In_frame_size - 3) // 4):
-                idx = 3 + j * 4
-                quat = out_seq[frame, idx:idx+4]
-                out_seq[frame, idx:idx+4] = quat / (np.linalg.norm(quat) + 1e-8)
+        gt_filename = save_dance_folder+"%07d"%iteration+"_gt.bvh"
+        out_filename = save_dance_folder+"%07d"%iteration+"_out.bvh"
 
-        # Save ground truth and output sequences to temporary npy files
-        gt_npy_path = save_dance_folder + "%07d"%iteration + "_gt.npy"
-        out_npy_path = save_dance_folder + "%07d"%iteration + "_out.npy"
+        read_bvh.write_traindata_to_bvh(gt_filename, gt_seq)
+        read_bvh.write_traindata_to_bvh(out_filename, out_seq)
 
-        np.save(gt_npy_path, gt_seq)
-        np.save(out_npy_path, out_seq)
-
-        # Convert quaternion data back to BVH format
-        gt_bvh_path = save_dance_folder + "%07d"%iteration + "_gt.bvh"
-        out_bvh_path = save_dance_folder + "%07d"%iteration + "_out.bvh"
-
-        # Use the decoder function to convert npy to bvh
-        generate_bvh_from_quad_traindata(gt_npy_path, gt_bvh_path)
-        generate_bvh_from_quad_traindata(out_npy_path, out_bvh_path)
-
-        # Clean up temporary npy files
-        os.remove(gt_npy_path)
-        os.remove(out_npy_path)
 
 #input a list of dances [dance1, dance2, dance3]
 #return a list of dance index, the occurence number of a dance's index is proportional to the length of the dance
@@ -328,10 +281,9 @@ def load_dances(dance_folder):
     dances=[]
     print('Loading motion files...')
     for dance_file in dance_files:
-        if dance_file.endswith(".npy"):  # Only load .npy files for quaternion data
-            # print ("load "+dance_file)
-            dance=np.load(dance_folder+dance_file)
-            dances=dances+[dance]
+        # print ("load "+dance_file)
+        dance=np.load(dance_folder+dance_file)
+        dances=dances+[dance]
     print(len(dances), ' Motion files loaded')
 
     return dances
@@ -371,28 +323,16 @@ def train(dances, frame_rate, batch, seq_len, read_weight_path, write_weight_fol
             dance=dances[dance_id].copy()
             dance_len = dance.shape[0]
 
+# Line 240 in the train function:
             start_id = random.randint(10, int(dance_len-seq_len*speed-10))
             sample_seq=[]
             for i in range(seq_len):
                 sample_seq=sample_seq+[dance[int(i*speed+start_id)]]
 
-            # For quaternion data, augmentation is more complex - need rotation composition
-            # Basic position augmentation for now
-            T=[0.1*(random.random()-0.5), 0.0, 0.1*(random.random()-0.5)]
-            R=[0, 1, 0, (random.random()-0.5)*np.pi*2]
-
-            # Apply augmentation - for quaternion data
-            # For now, just translate the root position
-            sample_seq_augmented = np.array(sample_seq)
-            for i in range(len(sample_seq)):
-                # Apply translation to root position (first 3 values)
-                sample_seq_augmented[i, 0] += T[0]
-                sample_seq_augmented[i, 1] += T[1]
-                sample_seq_augmented[i, 2] += T[2]
-
-                # Note: proper quaternion rotation composition would be more complex
-                # and would need to be implemented to handle R rotation properly
-
+            # augment the direction and position of the dance, helps the model to not overfeed
+            T=[0.1*(random.random()-0.5),0.0, 0.1*(random.random()-0.5)]
+            R=[0,1,0,(random.random()-0.5)*np.pi*2]
+            sample_seq_augmented=read_bvh.augment_train_data(sample_seq, T, R)
             dance_batch=dance_batch+[sample_seq_augmented]
         dance_batch_np=np.array(dance_batch)
 
@@ -419,11 +359,11 @@ def main():
     parser.add_argument('--read_weight_path', type=str, default="", help='Checkpoint model path')
     parser.add_argument('--dance_frame_rate', type=int, default=60, help='Dance frame rate')
     parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
-    parser.add_argument('--in_frame', type=int, default=227, help='Input channel (227 for quaternion data)')
-    parser.add_argument('--out_frame', type=int, default=227, help='Output channels (227 for quaternion data)')
-    parser.add_argument('--hidden_size', type=int, default=1024, help='Hidden size for LSTM')
-    parser.add_argument('--seq_len', type=int, default=100, help='Sequence length')
-    parser.add_argument('--total_iterations', type=int, default=100000, help='Total training iterations')
+    parser.add_argument('--in_frame', type=int, required=True, help='Input channel')
+    parser.add_argument('--out_frame', type=int, required=True, help='Output channels')
+    parser.add_argument('--hidden_size', type=int, default=1024, help='Checkpoint model path')
+    parser.add_argument('--seq_len', type=int, default=100, help='Checkpoint model path')
+    parser.add_argument('--total_iterations', type=int, default=100000, help='Checkpoint model path')
 
     args = parser.parse_args()
 
@@ -433,7 +373,7 @@ def main():
     if not os.path.exists(args.write_bvh_motion_folder):
         os.makedirs(args.write_bvh_motion_folder)
 
-    dances = load_dances(args.dances_folder)
+    dances= load_dances(args.dances_folder)
 
     train(dances, args.dance_frame_rate, args.batch_size, args.seq_len, args.read_weight_path, args.write_weight_folder,
           args.write_bvh_motion_folder, args.in_frame, args.out_frame, args.hidden_size, total_iter=args.total_iterations)
