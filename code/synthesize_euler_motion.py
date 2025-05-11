@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Euler-angle Motion Synthesis Refactored
+Euler-angle Motion Synthesis
 
 Loads encoded .npy clips, selects random seed segments,
 and generates continuation via an acLSTM model.
