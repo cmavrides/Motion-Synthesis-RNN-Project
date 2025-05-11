@@ -1,382 +1,329 @@
-import os
+import argparse
+import random
+import shutil
+import tempfile
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
-import numpy as np
-import random
-import read_bvh
-import argparse
+import torch.nn.functional as F
 
+import read_bvh
+from generate_training_quad_data import generate_bvh_from_quad_traindata, weight_translation
+
+# Index of hip joint in BVH data
 Hip_index = read_bvh.joint_index['hip']
 
-Seq_len=100
-Hidden_size = 1024
-Joints_num =  57
-Condition_num=5
-Groundtruth_num=5
-In_frame_size = 227
-
-def normalize_quaternions_torch(seq, root_dim=3):
-        """
-        seq shape: [batch, seq_len, frame_size]
-        Normalize each quaternion [w, x, y, z] without doing in-place slicing,
-        preserving gradient flows.
-        """
-        batch, seq_len, frame_size = seq.shape
-        quat_dim = frame_size - root_dim
-        joint_count = quat_dim // 4
-
-        # Flatten [batch, seq_len, frame_size], using reshape instead of view
-        seq_flat = seq.reshape(batch * seq_len, frame_size)
-
-        quats = seq_flat[:, root_dim:]  # shape: [batch*seq_len, quat_dim]
-        quats_reshaped = quats.reshape(-1, joint_count, 4)
-
-        # Compute norms and normalize
-        norms = quats_reshaped.norm(dim=2, keepdim=True) + 1e-8
-        quats_normalized = quats_reshaped / norms
-
-        # Rebuild a safe copy of the full sequence
-        out = seq.clone().reshape(batch * seq_len, frame_size)
-        out[:, root_dim:] = quats_normalized.reshape(batch * seq_len, quat_dim)
-
-        return out.reshape(batch, seq_len, frame_size)
+# Default hyperparameters
+DEFAULT_SEQ_LEN = 100
+DEFAULT_HIDDEN_SIZE = 1024
+Joints_num = 43
+In_frame_size = 3 + 4 * Joints_num
+Condition_num = 5
+Groundtruth_num = 5
 
 
-def calculate_quaternion_loss(self, out_seq, groundtruth_seq):
-                batch, total_dim = out_seq.shape
-                frame_size = 227
-                seq_len = total_dim // frame_size
-
-                out_seq_reshaped = out_seq.view(batch, seq_len, frame_size)
-                gt_seq_reshaped = groundtruth_seq.view(batch, seq_len, frame_size)
-
-                # Normalize quaternions in torch to maintain gradient flow
-                out_seq_norm = normalize_quaternions_torch(out_seq_reshaped)
-
-                loss_function = nn.MSELoss()
-                loss = loss_function(out_seq_norm, gt_seq_reshaped)
-                return loss
-
-def generate_bvh_from_quad_traindata(src_train_folder, tar_bvh_folder):
-    if not os.path.exists(tar_bvh_folder):
-        os.makedirs(tar_bvh_folder)
-
-    for filename in os.listdir(src_train_folder):
-        if filename.endswith(".npy"):
-            train_data_path = os.path.join(src_train_folder, filename)
-            quat_data = np.load(train_data_path)
-            # Convert quaternions back to Euler angles for BVH
-            euler_data = []
-            for frame in quat_data:
-                root = frame[:3]
-                quats = frame[3:].reshape(-1, 4)  # shape: (num_joints, 4)
-                # Convert each joint's quaternion to Euler angles (BVH is usually ZXY order)
-                eulers = R.from_quat(quats).as_euler('zxy', degrees=True)  # shape: (num_joints, 3)
-                euler_frame = np.concatenate([root, eulers.flatten()])
-                euler_data.append(euler_frame)
-            euler_data = np.array(euler_data)
-            bvh_out_path = os.path.join(tar_bvh_folder, filename.replace(".npy", ".bvh"))
-            read_bvh.write_traindata_to_bvh(bvh_out_path, euler_data)
-            print(f"Reconstructed BVH from quaternion data saved: {bvh_out_path}")
+def get_condition_list(condition_num: int, groundtruth_num: int, seq_len: int) -> np.ndarray:
+    """
+    Produce a repeating pattern of groundtruth (1) and condition (0) flags of length seq_len.
+    """
+    ones = np.ones((seq_len, groundtruth_num), dtype=np.int32)
+    zeros = np.zeros((seq_len, condition_num), dtype=np.int32)
+    pattern = np.concatenate((ones, zeros), axis=1).reshape(-1)
+    return pattern[:seq_len]
 
 
 class acLSTM(nn.Module):
-    def __init__(self, in_frame_size=227, hidden_size=1024, out_frame_size=227):
-        super(acLSTM, self).__init__()
+    def __init__(self,
+                 in_frame_size: int,
+                 hidden_size: int,
+                 out_frame_size: int):
+        super().__init__()
+        self.in_frame_size = in_frame_size
+        self.hidden_size = hidden_size
+        self.out_frame_size = out_frame_size
 
-        self.in_frame_size=in_frame_size
-        self.hidden_size=hidden_size
-        self.out_frame_size=out_frame_size
+        self.lstm1 = nn.LSTMCell(in_frame_size, hidden_size)
+        self.lstm2 = nn.LSTMCell(hidden_size, hidden_size)
+        self.lstm3 = nn.LSTMCell(hidden_size, hidden_size)
+        self.decoder = nn.Linear(hidden_size, out_frame_size)
 
-        ##lstm#########################################################
-        self.lstm1 = nn.LSTMCell(self.in_frame_size, self.hidden_size)#param+ID
-        self.lstm2 = nn.LSTMCell(self.hidden_size, self.hidden_size)
-        self.lstm3 = nn.LSTMCell(self.hidden_size, self.hidden_size)
-        self.decoder = nn.Linear(self.hidden_size, self.out_frame_size)
+    def init_hidden(self, batch: int, device: torch.device):
+        """
+        Initialize hidden and cell states for 3-layer LSTM.
+        """
+        zeros = torch.zeros(batch, self.hidden_size, device=device)
+        return ([zeros.clone() for _ in range(3)],
+                [zeros.clone() for _ in range(3)])
 
+    def forward_lstm(self,
+                     in_frame: torch.Tensor,
+                     h: list[torch.Tensor],
+                     c: list[torch.Tensor]) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor]]:
+        h0, c0 = self.lstm1(in_frame, (h[0], c[0]))
+        h1, c1 = self.lstm2(h0, (h[1], c[1]))
+        h2, c2 = self.lstm3(h1, (h[2], c[2]))
+        out_frame = self.decoder(h2)
+        return out_frame, [h0, h1, h2], [c0, c1, c2]
 
-    #output: [batch*1024, batch*1024, batch*1024], [batch*1024, batch*1024, batch*1024]
-    def init_hidden(self, batch):
-        #c batch*(3*1024)
-        c0 = torch.autograd.Variable(torch.FloatTensor(np.zeros((batch, self.hidden_size)) ).cuda())
-        c1= torch.autograd.Variable(torch.FloatTensor(np.zeros((batch, self.hidden_size)) ).cuda())
-        c2 = torch.autograd.Variable(torch.FloatTensor(np.zeros((batch, self.hidden_size)) ).cuda())
-        h0 = torch.autograd.Variable(torch.FloatTensor(np.zeros((batch, self.hidden_size)) ).cuda())
-        h1= torch.autograd.Variable(torch.FloatTensor(np.zeros((batch, self.hidden_size)) ).cuda())
-        h2= torch.autograd.Variable(torch.FloatTensor(np.zeros((batch, self.hidden_size)) ).cuda())
-        return  ([h0,h1,h2], [c0,c1,c2])
+    def forward(self,
+                real_seq: torch.Tensor,
+                condition_num: int = Condition_num,
+                groundtruth_num: int = Groundtruth_num) -> torch.Tensor:
+        batch, seq_len, _ = real_seq.shape
+        D = self.out_frame_size
+        M = (D - 3) // 4
+        device = real_seq.device
 
-    #in_frame b*In_frame_size
-    #vec_h [b*1024,b*1024,b*1024] vec_c [b*1024,b*1024,b*1024]
-    #out_frame b*In_frame_size
-    #vec_h_new [b*1024,b*1024,b*1024] vec_c_new [b*1024,b*1024,b*1024]
-    def forward_lstm(self, in_frame, vec_h, vec_c):
+        cond = get_condition_list(condition_num, groundtruth_num, seq_len)
+        h, c = self.init_hidden(batch, device)
 
-        vec_h0,vec_c0=self.lstm1(in_frame, (vec_h[0],vec_c[0]))
-        vec_h1,vec_c1=self.lstm2(vec_h[0], (vec_h[1],vec_c[1]))
-        vec_h2,vec_c2=self.lstm3(vec_h[1], (vec_h[2],vec_c[2]))
+        out_seq = []
+        out_frame = torch.zeros(batch, D, device=device)
 
-        out_frame = self.decoder(vec_h2) #out b*150
-        vec_h_new=[vec_h0, vec_h1, vec_h2]
-        vec_c_new=[vec_c0, vec_c1, vec_c2]
+        for t in range(seq_len):
+            inp = real_seq[:, t] if cond[t] == 1 else out_frame
+            raw, h, c = self.forward_lstm(inp, h, c)
 
+            hip = raw[:, :3]
+            quats = raw[:, 3:].view(batch, M, 4)
+            quats = F.normalize(quats, p=2, dim=-1, eps=1e-6)
+            out_frame = torch.cat([hip, quats.view(batch, M * 4)], dim=1)
+            out_seq.append(out_frame.unsqueeze(1))
 
-        return (out_frame,  vec_h_new, vec_c_new)
+        # concatenate and flatten: [batch, seq_len, D] -> [batch, seq_len*D]
+        return torch.cat(out_seq, dim=1).reshape(batch, -1)
 
-    #output numpy condition list in the form of [groundtruth_num of 1, condition_num of 0, groundtruth_num of 1, condition_num of 0,.....]
-    def get_condition_lst(self,condition_num, groundtruth_num, seq_len ):
-        gt_lst=np.ones((100,groundtruth_num))
-        con_lst=np.zeros((100,condition_num))
-        lst=np.concatenate((gt_lst, con_lst),1).reshape(-1)
-        return lst[0:seq_len]
+    def calculate_loss(self,
+                       out_flat: torch.Tensor,
+                       gt_flat: torch.Tensor) -> torch.Tensor:
+        B, flat = out_flat.size()
+        D = self.out_frame_size
+        L = flat // D
 
+        out = out_flat.view(B, L, D)
+        gt = gt_flat.view(B, L, D)
 
-    #in cuda tensor real_seq: b*seq_len*frame_size
-    #out cuda tensor out_seq  b* (seq_len*frame_size)
-    def forward(self, real_seq, condition_num=5, groundtruth_num=5):
+        # hip translation MSE
+        hip_loss = F.mse_loss(out[:, :, :3], gt[:, :, :3])
 
-        batch=real_seq.size()[0]
-        seq_len=real_seq.size()[1]
+        # quaternion angle loss
+        M = (D - 3) // 4
+        pred_q = out[:, :, 3:].view(B, L, M, 4)
+        gt_q = gt[:, :, 3:].view(B, L, M, 4)
+        pred_q = F.normalize(pred_q, p=2, dim=-1, eps=1e-6)
 
-        condition_lst=self.get_condition_lst(condition_num, groundtruth_num, seq_len)
+        dot = torch.clamp((pred_q * gt_q).sum(-1), -1.0 + 1e-6, 1.0 - 1e-6)
+        angle = 2 * torch.acos(torch.abs(dot))
+        quat_loss = angle.mean()
 
-        #initialize vec_h vec_m #set as 0
-        (vec_h, vec_c) = self.init_hidden(batch)
-
-        out_seq = torch.autograd.Variable(torch.FloatTensor(  np.zeros((batch,1))   ).cuda())
-
-        out_frame=torch.autograd.Variable(torch.FloatTensor(  np.zeros((batch,self.out_frame_size))  ).cuda())
-
-
-        for i in range(seq_len):
-
-            if(condition_lst[i]==1):##input groundtruth frame
-                in_frame=real_seq[:,i]
-            else:
-                in_frame=out_frame
-
-            (out_frame, vec_h,vec_c) = self.forward_lstm(in_frame, vec_h, vec_c)
-
-            out_seq = torch.cat((out_seq, out_frame),1)
-
-        return out_seq[:, 1: out_seq.size()[1]]
-
-    #cuda tensor out_seq batch*(seq_len*frame_size)
-    #cuda tensor groundtruth_seq batch*(seq_len*frame_size)
-    def calculate_loss(self, out_seq, groundtruth_seq):
-        batch, total_dim = out_seq.shape
-        frame_size = self.out_frame_size
-        seq_len = total_dim // frame_size
-
-        out_seq_reshaped = out_seq.view(batch, seq_len, frame_size)
-        gt_seq_reshaped = groundtruth_seq.view(batch, seq_len, frame_size)
-
-        # Normalize quaternions in torch to maintain gradient flow
-        out_seq_norm = normalize_quaternions_torch(out_seq_reshaped)
-        gt_seq_norm = normalize_quaternions_torch(gt_seq_reshaped)  # Also normalize ground truth
-
-        # Root position loss (MSE on first 3 values)
-        root_loss = nn.MSELoss()(out_seq_norm[:,:,:3], gt_seq_norm[:,:,:3])
-
-        # Quaternion loss (MSE on normalized quaternions)
-        quat_loss = nn.MSELoss()(out_seq_norm[:,:,3:], gt_seq_norm[:,:,3:])
-
-        # Combine losses - weight can be adjusted as needed
-        total_loss = root_loss + quat_loss
-
-        return total_loss
+        return hip_loss + quat_loss
 
 
-#numpy array real_seq_np: batch*seq_len*frame_size
-def train_one_iteraton(real_seq_np, model, optimizer, iteration, save_dance_folder, print_loss=False, save_bvh_motion=True):
+import torch
+import torch.nn.functional as F
+import numpy as np
+import tempfile
+from pathlib import Path
+from generate_training_quad_data import generate_bvh_from_quad_traindata
 
-    # set hip_x and hip_z as the difference from the future frame to current frame
-    # Subtract post (t+1) - t. Then, you will have the difference between each pose timestamp
-    dif = real_seq_np[:, 1:real_seq_np.shape[1]] - real_seq_np[:, 0: real_seq_np.shape[1]-1]
-    real_seq_dif_hip_x_z_np = real_seq_np[:, 0:real_seq_np.shape[1]-1].copy()
+def train_one_iteration(
+    real_seq_np: np.ndarray,
+    model: acLSTM,
+    optimizer: torch.optim.Optimizer,
+    iteration: int,
+    total_iterations: int,
+    save_dance_folder: Path,
+    print_loss: bool = False,
+    save_bvh_motion: bool = True
+) -> None:
+    """
+    One training step with scheduled sampling and a warm‐up period:
+      - real_seq_np: (B, seq_len+1, D) absolute (scaled hip+quats)
+      - seq_len+1 = 100+2 = 102 deltas → 101 inputs
+    """
+    # 1) Build Δ-hip inputs
+    dif = real_seq_np[:, 1:, :3] - real_seq_np[:, :-1, :3]
+    real_seq_diff = real_seq_np[:, :-1].copy()        # [B, 102, D]
+    real_seq_diff[:, :, 0] = dif[:, :, 0]
+    real_seq_diff[:, :, 2] = dif[:, :, 2]
 
-    # Replace the values with the difference of each step to the previus step
-    real_seq_dif_hip_x_z_np[:,:,Hip_index*3]=dif[:,:,Hip_index*3]
-    real_seq_dif_hip_x_z_np[:,:,Hip_index*3+2]=dif[:,:,Hip_index*3+2]
+    # 2) To tensors: inp=(B,101,D), gt_seq=(B,101,D)
+    device = next(model.parameters()).device
+    inp    = torch.from_numpy(real_seq_diff[:, :-1]).float().to(device)
+    gt_seq = torch.from_numpy(real_seq_diff[:,  1: ]).float().to(device)
+    B, L, D = inp.shape
+    M = (D - 3) // 4
 
-    real_seq = torch.autograd.Variable(torch.FloatTensor(real_seq_dif_hip_x_z_np.tolist()).cuda())
+    # 3) Compute teacher-forcing ratio with warmup
+    warmup_iters = 10000
+    if iteration < warmup_iters:
+        teacher_ratio = 1.0
+    else:
+        teacher_ratio = max(
+            0.0,
+            1.0 - (iteration - warmup_iters) / float(total_iterations - warmup_iters)
+        )
 
-    seq_len=real_seq.size()[1]-1
-    in_real_seq=real_seq[:, 0:seq_len]
+    # 4) Unroll LSTM with per-step sampling; always force t=0
+    h, c      = model.init_hidden(B, device)
+    out_frame = torch.zeros(B, D, device=device)
+    outputs   = []
 
-    predict_groundtruth_seq = torch.autograd.Variable(torch.FloatTensor(real_seq_dif_hip_x_z_np[:, 1:seq_len+1].tolist())).cuda().view(real_seq_np.shape[0], -1)
+    for t in range(L):
+        if t == 0:
+            inp_t = inp[:, 0, :]
+        else:
+            mask = (torch.rand(B, device=device) < teacher_ratio).float().unsqueeze(1)
+            inp_t = mask * inp[:, t, :] + (1.0 - mask) * out_frame
 
-    predict_seq = model.forward(in_real_seq, Condition_num, Groundtruth_num)
+        raw, h, c = model.forward_lstm(inp_t, h, c)
+        hip   = raw[:, :3]
+        quats = raw[:, 3:].view(B, M, 4)
+        quats = F.normalize(quats, p=2, dim=-1, eps=1e-6)
+        out_frame = torch.cat([hip, quats.view(B, M*4)], dim=1)
+        outputs.append(out_frame.unsqueeze(1))
 
+    # 5) Flatten predictions & ground truth for loss
+    pred_flat = torch.cat(outputs, dim=1).reshape(B, -1)  # [B,101*D]
+    gt_flat   = gt_seq.reshape(B, -1)                    # [B,101*D]
+
+    # 6) Backprop
     optimizer.zero_grad()
-
-    # The loss function needs to change for each representation
-    loss = model.calculate_loss(predict_seq, predict_groundtruth_seq)
-
+    loss = model.calculate_loss(pred_flat, gt_flat)
     loss.backward()
-
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
 
-    if(print_loss==True):
-        print ("###########"+"iter %07d"%iteration +"######################")
-        print ("loss: "+str(loss.detach().cpu().numpy()))
+    if print_loss:
+        print(f"Iter {iteration:07d}  Loss={loss.item():.6f}")
+
+    # 7) Optional BVH snapshot
+    if save_bvh_motion:
+        D0 = D
+        L0 = pred_flat.size(1) // D0
+        pred_enc = pred_flat[0].detach().cpu().numpy().reshape(L0, D0)
+
+        # integrate hip deltas → absolute
+        pred_enc[:, 0] = np.cumsum(pred_enc[:, 0])
+        pred_enc[:, 2] = np.cumsum(pred_enc[:, 2])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp     = Path(tmpdir)
+            gt_npy  = tmp / f"{iteration:07d}_gt.bvh.npy"
+            out_npy = tmp / f"{iteration:07d}_out.bvh.npy"
+            np.save(str(gt_npy), real_seq_np[0, 1:1+L0, :])
+            np.save(str(out_npy), pred_enc)
+            generate_bvh_from_quad_traindata(str(tmp), str(save_dance_folder))
 
 
-    if(save_bvh_motion==True):
-        ##save the first motion sequence int the batch.
-        gt_seq = np.array(predict_groundtruth_seq[0].data.tolist()).reshape(-1,In_frame_size)
-        last_x = 0.0
-        last_z = 0.0
-        # Change hip xyz previous hip location for ground truth sequence
-        for frame in range(gt_seq.shape[0]):
-            gt_seq[frame,Hip_index*3]=gt_seq[frame,Hip_index*3]+last_x
-            last_x=gt_seq[frame,Hip_index*3]
 
-            gt_seq[frame,Hip_index*3+2]=gt_seq[frame,Hip_index*3+2]+last_z
-            last_z=gt_seq[frame,Hip_index*3+2]
-
-        out_seq=np.array(predict_seq[0].data.tolist()).reshape(-1,In_frame_size)
-        last_x=0.0
-        last_z=0.0
-        # Change hip xyz based on previous hip locations for out seq
-        for frame in range(out_seq.shape[0]):
-            out_seq[frame,Hip_index*3]=out_seq[frame,Hip_index*3]+last_x
-            last_x=out_seq[frame,Hip_index*3]
-
-            out_seq[frame,Hip_index*3+2]=out_seq[frame,Hip_index*3+2]+last_z
-            last_z=out_seq[frame,Hip_index*3+2]
+def get_dance_length_list(dances: list[np.ndarray]) -> list[int]:
+    """Build a list of dance indices weighted by dance duration."""
+    lengths = [max(1, int(len(dance) / 100)) for dance in dances]
+    indices = [i for i, l in enumerate(lengths) for _ in range(l)]
+    return indices
 
 
-        gt_filename = save_dance_folder+"%07d"%iteration+"_gt.bvh"
-        out_filename = save_dance_folder+"%07d"%iteration+"_out.bvh"
-
-        read_bvh.write_traindata_to_bvh(gt_filename, gt_seq)
-        read_bvh.write_traindata_to_bvh(out_filename, out_seq)
-
-
-#input a list of dances [dance1, dance2, dance3]
-#return a list of dance index, the occurence number of a dance's index is proportional to the length of the dance
-def get_dance_len_lst(dances):
-    len_lst=[]
-    for dance in dances:
-        #length=len(dance)/100
-        length = 10
-        if(length<1):
-            length=1
-        len_lst=len_lst+[length]
-
-    index_lst=[]
-    index=0
-    for length in len_lst:
-        for i in range(length):
-            index_lst=index_lst+[index]
-        index=index+1
-    return index_lst
-
-#input dance_folder name
-#output a list of dances.
-def load_dances(dance_folder):
-    dance_files=os.listdir(dance_folder)
-    dances=[]
-    print('Loading motion files...')
-    for dance_file in dance_files:
-        # print ("load "+dance_file)
-        dance=np.load(dance_folder+dance_file)
-        dances=dances+[dance]
-    print(len(dances), ' Motion files loaded')
-
+def load_dances(dance_folder: Path) -> list[np.ndarray]:
+    """Load and renormalize quaternion dances from a folder of .npy files."""
+    dances = []
+    print("Loading motion files...")
+    for f in dance_folder.iterdir():
+        if f.suffix.lower() != '.npy':
+            continue
+        arr = np.load(str(f))
+        # renormalize quaternions
+        flat_q = arr[:, 3:].reshape(-1, 4)
+        norms = np.linalg.norm(flat_q, axis=1, keepdims=True)
+        flat_q /= norms
+        arr[:, 3:] = flat_q.reshape(arr[:, 3:].shape)
+        dances.append(arr)
+    print(f"{len(dances)} motion files loaded.")
     return dances
 
-# dances: [dance1, dance2, dance3,....]
-def train(dances, frame_rate, batch, seq_len, read_weight_path, write_weight_folder,
-          write_bvh_motion_folder, in_frame, out_frame, hidden_size=1024, total_iter=500000):
 
-    seq_len=seq_len+2
-    torch.cuda.set_device(0)
-
-    model = acLSTM(in_frame_size=in_frame, hidden_size=hidden_size, out_frame_size=out_frame)
-
-    if(read_weight_path!=""):
-        model.load_state_dict(torch.load(read_weight_path))
-
-    model.cuda()
-    #model=torch.nn.DataParallel(model, device_ids=[0,1])
-
-    current_lr=0.0001
-    optimizer = torch.optim.Adam(model.parameters(), lr=current_lr)
-
+def train(dances: list[np.ndarray],
+          frame_rate: float,
+          batch_size: int,
+          seq_len: int,
+          read_weight_path: str,
+          write_weight_folder: Path,
+          write_bvh_motion_folder: Path,
+          in_frame: int,
+          out_frame: int,
+          hidden_size: int,
+          total_iter: int) -> None:
+    """Full training loop."""
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    model = acLSTM(in_frame, hidden_size, out_frame).to(device)
+    if read_weight_path:
+        model.load_state_dict(torch.load(read_weight_path, map_location=device))
+    optimizer = torch.optim.Adam(model.parameters(), lr=5e-5)
     model.train()
 
-    #dance_len_lst contains the index of the dance, the occurance number of a dance's index is proportional to the length of the dance
-    dance_len_lst=get_dance_len_lst(dances)
-    random_range=len(dance_len_lst)
-
-    speed=frame_rate/30 # we train the network with frame rate of 30
+    dance_indices = get_dance_length_list(dances)
+    speed = frame_rate / 30.0
+    seq_len += 2
 
     for iteration in range(total_iter):
-        #get a batch of dances
-        dance_batch=[]
-        for b in range(batch):
-            # randomly pick up one dance. the longer the dance is the more likely the dance is picked up
-            dance_id = dance_len_lst[np.random.randint(0,random_range)]
-            dance=dances[dance_id].copy()
-            dance_len = dance.shape[0]
+        batch = []
+        for _ in range(batch_size):
+            idx = random.choice(dance_indices)
+            dance = dances[idx]
+            F = len(dance)
+            start = random.randint(10, max(10, int(F - seq_len*speed - 10)))
+            seq = [dance[int(i*speed + start)] for i in range(seq_len + 1)]
+            batch.append(seq)
+        batch_np = np.array(batch)
 
-# Line 240 in the train function:
-            start_id = random.randint(10, int(dance_len-seq_len*speed-10))
-            sample_seq=[]
-            for i in range(seq_len):
-                sample_seq=sample_seq+[dance[int(i*speed+start_id)]]
+        print_loss = (iteration % 20 == 0)
+        save_bvh = (iteration % 1000 == 0)
+        if save_bvh:
+            ckpt = write_weight_folder / f"{iteration:07d}.weight"
+            torch.save(model.state_dict(), str(ckpt))
 
-            # augment the direction and position of the dance, helps the model to not overfeed
-            T=[0.1*(random.random()-0.5),0.0, 0.1*(random.random()-0.5)]
-            R=[0,1,0,(random.random()-0.5)*np.pi*2]
-            sample_seq_augmented=read_bvh.augment_train_data(sample_seq, T, R)
-            dance_batch=dance_batch+[sample_seq_augmented]
-        dance_batch_np=np.array(dance_batch)
+        train_one_iteration(batch_np, model, optimizer,
+                    iteration, total_iter,
+                    write_bvh_motion_folder,
+                    print_loss, save_bvh)
 
-
-        print_loss=False
-        save_bvh_motion=False
-        if(iteration % 20==0):
-            print_loss=True
-        if(iteration % 1000==0):
-            save_bvh_motion=True
-            path = write_weight_folder + "%07d"%iteration +".weight"
-            torch.save(model.state_dict(), path)
-
-        train_one_iteraton(dance_batch_np, model, optimizer, iteration, write_bvh_motion_folder, print_loss, save_bvh_motion)
 
 
 def main():
-
     parser = argparse.ArgumentParser()
-
-    parser.add_argument('--dances_folder', type=str, required=True, help='Path for the training data')
-    parser.add_argument('--write_weight_folder', type=str, required=True, help='Path to store checkpoints')
-    parser.add_argument('--write_bvh_motion_folder', type=str, required=True, help='Path to store test generated bvh')
-    parser.add_argument('--read_weight_path', type=str, default="", help='Checkpoint model path')
-    parser.add_argument('--dance_frame_rate', type=int, default=60, help='Dance frame rate')
-    parser.add_argument('--batch_size', type=int, default=32, help='Batch size')
-    parser.add_argument('--in_frame', type=int, required=True, help='Input channel')
-    parser.add_argument('--out_frame', type=int, required=True, help='Output channels')
-    parser.add_argument('--hidden_size', type=int, default=1024, help='Checkpoint model path')
-    parser.add_argument('--seq_len', type=int, default=100, help='Checkpoint model path')
-    parser.add_argument('--total_iterations', type=int, default=100000, help='Checkpoint model path')
-
+    parser.add_argument('--dances_folder', type=Path, required=True)
+    parser.add_argument('--write_weight_folder', type=Path, required=True)
+    parser.add_argument('--write_bvh_motion_folder', type=Path, required=True)
+    parser.add_argument('--read_weight_path', type=str, default="")
+    parser.add_argument('--dance_frame_rate', type=int, default=60)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--in_frame', type=int, required=True)
+    parser.add_argument('--out_frame', type=int, required=True)
+    parser.add_argument('--hidden_size', type=int, default=DEFAULT_HIDDEN_SIZE)
+    parser.add_argument('--seq_len', type=int, default=DEFAULT_SEQ_LEN)
+    parser.add_argument('--total_iterations', type=int, default=100000)
     args = parser.parse_args()
 
+    args.write_weight_folder.mkdir(parents=True, exist_ok=True)
+    args.write_bvh_motion_folder.mkdir(parents=True, exist_ok=True)
 
-    if not os.path.exists(args.write_weight_folder):
-        os.makedirs(args.write_weight_folder)
-    if not os.path.exists(args.write_bvh_motion_folder):
-        os.makedirs(args.write_bvh_motion_folder)
+    dances = load_dances(args.dances_folder)
+    train(
+        dances,
+        args.dance_frame_rate,
+        args.batch_size,
+        args.seq_len,
+        args.read_weight_path,
+        args.write_weight_folder,
+        args.write_bvh_motion_folder,
+        args.in_frame,
+        args.out_frame,
+        args.hidden_size,
+        total_iter=args.total_iterations,
+    )
 
-    dances= load_dances(args.dances_folder)
-
-    train(dances, args.dance_frame_rate, args.batch_size, args.seq_len, args.read_weight_path, args.write_weight_folder,
-          args.write_bvh_motion_folder, args.in_frame, args.out_frame, args.hidden_size, total_iter=args.total_iterations)
 
 if __name__ == '__main__':
     main()
