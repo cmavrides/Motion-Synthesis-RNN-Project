@@ -1,102 +1,133 @@
-import read_bvh
+
+"""
+Unified BVH ⇄ Euler-angle training-data converter with optional reconstruction.
+"""
+
+from pathlib import Path
+import math
 import numpy as np
-import os
+import read_bvh
 
-# Desired fixed feature dimension
-FEATURE_DIM = 171
-# Constants for normalization
-WEIGHT_TRANSLATION = 0.01  # scale for translation channels
-ANGLE_SCALE = 180.0        # maximum absolute Euler angle in degrees
-
-# Standard BVH template (for write_frames) and its param count
-STANDARD_BVH_FILE = "train_data_bvh/standard.bvh"
-# Load once to get expected raw parameter count
-_template = read_bvh.parse_frames(STANDARD_BVH_FILE)
-EXPECTED_PARAMS = _template.shape[1]
+# scale factor: metres → tens of cm
+TRANSLATION_SCALE = 0.01
 
 
-def _pad_or_truncate(array, target_dim):
-    """Pad with zeros or truncate each feature vector to target_dim columns."""
-    F, D = array.shape
-    if D == target_dim:
-        return array
-    elif D < target_dim:
-        pad_width = target_dim - D
-        padding = np.zeros((F, pad_width), dtype=array.dtype)
-        return np.concatenate([array, padding], axis=1)
+def generate_euler_traindata_from_bvh(
+    src_bvh_folder: str,
+    tar_traindata_folder: str
+) -> None:
+    """
+    Encode every *.bvh in `src_bvh_folder` as a normalized NumPy array (F×C):
+      • root translation [m] → scaled by TRANSLATION_SCALE
+      • Euler angles [deg] → radians
+    Saves each as *.npy in `tar_traindata_folder`.
+    """
+    process_motion_data(
+        source=src_bvh_folder,
+        target=tar_traindata_folder,
+        mode="encode"
+    )
+
+
+def generate_bvh_from_euler_traindata(
+    src_train_folder: str,
+    tar_bvh_folder: str,
+    template_bvh: str | None = None
+) -> None:
+    """
+    Decode each *.npy in `src_train_folder` back to BVH format:
+      • denormalize translation back to metres
+      • Euler angles [rad] → degrees
+    Uses `template_bvh` for hierarchy (default standard.bvh).
+    """
+    process_motion_data(
+        source=src_train_folder,
+        target=tar_bvh_folder,
+        mode="decode",
+        template=template_bvh
+    )
+
+
+def process_motion_data(
+    source: str,
+    target: str,
+    mode: str = "encode",
+    template: str | None = None
+) -> None:
+    """
+    Core converter: BVH ↔ NumPy .npy files.
+
+    Args:
+        source: directory of .bvh files (encode) or .npy files (decode).
+        target: output directory.
+        mode: 'encode' to BVH→.npy, 'decode' to .npy→BVH.
+        template: BVH hierarchy template for decode.
+    """
+    src_dir = Path(source)
+    tgt_dir = Path(target)
+    tgt_dir.mkdir(parents=True, exist_ok=True)
+
+    if mode == "decode":
+        if template is None:
+            template = (
+                Path(__file__).parent.parent
+                / "train_data_bvh"
+                / "standard.bvh"
+            )
+        template = Path(template)
+
+    for entry in src_dir.iterdir():
+        if mode == "encode" and entry.suffix.lower() == ".bvh":
+            frames = read_bvh.parse_frames(str(entry)).astype(np.float32)
+            frames[:, :3] *= TRANSLATION_SCALE
+            frames[:, 3:] *= math.pi / 180.0
+            out_f = tgt_dir / f"{entry.stem}.npy"
+            np.save(str(out_f), frames)
+            print(f"Saved encoded data: {out_f}")
+
+        elif mode == "decode" and entry.suffix.lower() == ".npy":
+            frames = np.load(str(entry)).astype(np.float32)
+            frames[:, :3] /= TRANSLATION_SCALE
+            frames[:, 3:] *= 180.0 / math.pi
+            out_f = tgt_dir / f"{entry.stem}.bvh"
+            read_bvh.write_frames(str(template), str(out_f), frames)
+            print(f"Reconstructed BVH: {out_f}")
+
+        # skip other file types automatically
+
+    if mode not in ("encode", "decode"):
+        raise ValueError(f"Invalid mode '{mode}'. Use 'encode' or 'decode'.")
+
+
+if __name__ == "__main__":
+    # ===== USER CONFIGURATION =====
+    SRC_FOLDER   = "../train_data_bvh/martial"      # directory of .bvh or .npy
+    DST_FOLDER   = "../train_data_euler/martial"   # where to write outputs
+    MODE         = "encode"             # 'encode' or 'decode'
+    TEMPLATE_BVH = "../train_data_bvh/standard.bvh"                  # bvH template if decoding
+
+    # Primary conversion
+    if MODE == "decode":
+        generate_bvh_from_euler_traindata(
+            SRC_FOLDER,
+            DST_FOLDER,
+            TEMPLATE_BVH
+        )
+        # optional: re-encode reconstructed BVH back to .npy
+        recon_encode_dir = Path(DST_FOLDER + "_reencoded")
+        generate_euler_traindata_from_bvh(
+            str(recon_encode_dir.parent),
+            str(recon_encode_dir)
+        )
     else:
-        # truncate extra dims to the first target_dim
-        return array[:, :target_dim]
-
-
-def generate_euler_traindata_from_bvh(src_bvh_folder, tar_traindata_folder):
-    """
-    Reads BVH files, normalizes translation+Euler angles, pads/truncates to FEATURE_DIM,
-    and saves as .npy arrays of shape (frames, FEATURE_DIM).
-    """
-    os.makedirs(tar_traindata_folder, exist_ok=True)
-
-    for fname in os.listdir(src_bvh_folder):
-        if not fname.lower().endswith('.bvh'):
-            continue
-        bvh_path = os.path.join(src_bvh_folder, fname)
-        raw = read_bvh.parse_frames(bvh_path)  # (F, P)
-
-        # Split raw into translation and angles
-        trans = raw[:, :3]
-        angles = raw[:, 3:]
-
-        # Normalize
-        trans_norm = trans * WEIGHT_TRANSLATION
-        angles_norm = angles / ANGLE_SCALE
-
-        # Combine and enforce FEATURE_DIM
-        data = np.concatenate([trans_norm, angles_norm], axis=1)
-        data_fixed = _pad_or_truncate(data, FEATURE_DIM)
-
-        out_file = os.path.join(tar_traindata_folder, fname.replace('.bvh', '.npy'))
-        np.save(out_file, data_fixed)
-        print(f"Saved Euler train data: {out_file} (shape: {data_fixed.shape})")
-
-
-def generate_bvh_from_euler_traindata(src_train_folder, tar_bvh_folder):
-    """
-    Loads .npy of shape (F, FEATURE_DIM), denormalizes, reconstructs raw channels,
-    pads/truncates to EXPECTED_PARAMS, and writes BVH using STANDARD_BVH_FILE.
-    """
-    os.makedirs(tar_bvh_folder, exist_ok=True)
-
-    for fname in os.listdir(src_train_folder):
-        if not fname.lower().endswith('.npy'):
-            continue
-        npy_path = os.path.join(src_train_folder, fname)
-        data_norm = np.load(npy_path)
-
-        # Enforce FEATURE_DIM
-        data_fixed = _pad_or_truncate(data_norm, FEATURE_DIM)
-
-        # Split back
-        trans_norm = data_fixed[:, :3]
-        angles_norm = data_fixed[:, 3:FEATURE_DIM]
-
-        # Denormalize
-        trans = trans_norm / WEIGHT_TRANSLATION
-        angles = angles_norm * ANGLE_SCALE
-
-        # Recombine raw channels and enforce EXPECTED_PARAMS
-        raw = np.concatenate([trans, angles], axis=1)
-        raw_fixed = _pad_or_truncate(raw, EXPECTED_PARAMS)
-
-        out_bvh = os.path.join(tar_bvh_folder, fname.replace('.npy', '.bvh'))
-        read_bvh.write_frames(STANDARD_BVH_FILE, out_bvh, raw_fixed)
-        print(f"Reconstructed BVH: {out_bvh} (params: {raw_fixed.shape[1]})")
-
-
-if __name__ == '__main__':
-    # Example usage (update paths accordingly)
-    bvh_dir_path = r"C:\Users\alexa\Desktop\MAI645_Team_04\train_data_bvh\martial"
-    euler_enc_dir_path = r"train_data_euler\martial"
-    bvh_reconstructed_dir_path = r"reconstructed_euler_bvh\martial"
-
-    generate_euler_traindata_from_bvh(bvh_dir_path, euler_enc_dir_path)
-    generate_bvh_from_euler_traindata(euler_enc_dir_path, bvh_reconstructed_dir_path)
+        generate_euler_traindata_from_bvh(
+            SRC_FOLDER,
+            DST_FOLDER
+        )
+        # optional: reconstruct BVH from encoded .npy
+        recon_bvh_dir = Path(DST_FOLDER + "_reconstructed_bvh")
+        generate_bvh_from_euler_traindata(
+            DST_FOLDER,
+            str(recon_bvh_dir),
+            TEMPLATE_BVH
+        )
