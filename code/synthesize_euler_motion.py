@@ -1,169 +1,198 @@
-#!/usr/bin/env python3
-"""
-Euler-angle Motion Synthesis
-
-Loads encoded .npy clips, selects random seed segments,
-and generates continuation via an acLSTM model.
-Outputs synthesized BVH files.
-"""
 import os
 import math
 import random
-from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
+import transforms3d.euler as euler
 
 import read_bvh
 
-# --- Constants ---
-HIDDEN_SIZE = 1024
-WEIGHT_TRANSLATION = 0.01
-HIP_INDEX = read_bvh.joint_index['hip']
+# Constants
+HIP_IDX = read_bvh.joint_index.get('hip', 0)
+TRANSLATION_SCALE = 0.01
+ANGLE_SCALE = 180.0 / math.pi
+DEFAULT_HIDDEN = 1024
 
-# --- Model Definition ---
-class acLSTM(nn.Module):
-    def __init__(self, frame_dim: int, hidden: int = HIDDEN_SIZE):
-        super().__init__()
-        self.lstm1 = nn.LSTMCell(frame_dim, hidden)
-        self.lstm2 = nn.LSTMCell(hidden, hidden)
-        self.lstm3 = nn.LSTMCell(hidden, hidden)
-        self.dec = nn.Linear(hidden, frame_dim)
+class MotionLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size: int = DEFAULT_HIDDEN):
+        super(MotionLSTM, self).__init__()
+        self.cell1 = nn.LSTMCell(input_size, hidden_size)
+        self.cell2 = nn.LSTMCell(hidden_size, hidden_size)
+        self.cell3 = nn.LSTMCell(hidden_size, hidden_size)
+        self.output_layer = nn.Linear(hidden_size, input_size)
 
     @staticmethod
-    def init_state(batch: int, device: torch.device):
-        h = [torch.zeros(batch, HIDDEN_SIZE, device=device) for _ in range(3)]
-        c = [torch.zeros(batch, HIDDEN_SIZE, device=device) for _ in range(3)]
-        return h, c
+    def init_states(batch_size: int, device):
+        h_states = [torch.zeros(batch_size, DEFAULT_HIDDEN, device=device) for _ in range(3)]
+        c_states = [torch.zeros(batch_size, DEFAULT_HIDDEN, device=device) for _ in range(3)]
+        return h_states, c_states
 
-    def forward_step(self, x: torch.Tensor, state):
-        h, c = state
-        h[0], c[0] = self.lstm1(x, (h[0], c[0]))
-        h[1], c[1] = self.lstm2(h[0], (h[1], c[1]))
-        h[2], c[2] = self.lstm3(h[1], (h[2], c[2]))
-        out = self.dec(h[2])
-        return out, (h, c)
+    def step(self, inp, states):
+        h_list, c_list = states
+        h_list[0], c_list[0] = self.cell1(inp, (h_list[0], c_list[0]))
+        h_list[1], c_list[1] = self.cell2(h_list[0], (h_list[1], c_list[1]))
+        h_list[2], c_list[2] = self.cell3(h_list[1], (h_list[2], c_list[2]))
+        return self.output_layer(h_list[2]), (h_list, c_list)
 
-    def forward(self, seq: torch.Tensor, *, gt: int, cond: int) -> torch.Tensor:
-        B, T, C = seq.shape
-        device = seq.device
-        pattern = torch.tensor(([1]*gt + [0]*cond) * ((T // (gt+cond)) + 1),
-                               device=device, dtype=torch.bool)[:T]
-        h, c = acLSTM.init_state(B, device)
-        xo = torch.zeros(B, C, device=device)
+    def forward(self, sequence, warmup: int = 5, predict: int = 5):
+        batch, seq_len, feat_dim = sequence.size()
+        device = sequence.device
+        # Build boolean mask: warmup True then predict False repeating
+        mask = ([True] * warmup + [False] * predict) * ((seq_len // (warmup + predict)) + 1)
+        mask = torch.tensor(mask[:seq_len], dtype=torch.bool, device=device)
+
+        h_states, c_states = MotionLSTM.init_states(batch, device)
+        previous_output = torch.zeros(batch, feat_dim, device=device)
         outputs = []
-        for t in range(T):
-            inp = seq[:, t] if pattern[t] else xo
-            xo, (h, c) = self.forward_step(inp, (h, c))
-            outputs.append(xo)
+
+        idx = 0
+        while idx < seq_len:
+            current_input = sequence[:, idx] if mask[idx] else previous_output
+            previous_output, (h_states, c_states) = self.step(current_input, (h_states, c_states))
+            outputs.append(previous_output)
+            idx += 1
+
         return torch.stack(outputs, dim=1)
 
-# --- Data Utilities ---
-def load_and_diff_clips(folder: Path) -> list[np.ndarray]:
-    """
-    Load .npy clips and apply hip X/Z frame differencing in-place.
-    """
-    clips = []
-    for file in sorted(folder.glob('*.npy')):
-        arr = np.load(file).astype(np.float32)
-        # subtract previous frame hip x,z
-        arr[1:, 0] -= arr[:-1, 0]
-        arr[1:, 2] -= arr[:-1, 2]
-        clips.append(arr)
-    return clips
 
-# --- Synthesis Pipeline ---
-def select_seeds(clips: list[np.ndarray], batch: int, seed_len: int) -> np.ndarray:
-    """
-    Randomly sample batch of seed sequences of length `seed_len`.
-    """
-    seeds = []
-    for _ in range(batch):
-        clip = random.choice(clips)
-        if len(clip) < seed_len:
-            raise ValueError("Clip shorter than seed length")
-        start = random.randint(0, len(clip) - seed_len)
-        seeds.append(clip[start:start + seed_len])
-    return np.stack(seeds, axis=0)  # shape (B, seed_len, D)
+def collect_motion_arrays(source_dir):
+    arrays = []
+    filenames = [f for f in os.listdir(source_dir) if f.lower().endswith('.npy')]
+    idx = 0
+    while idx < len(filenames):
+        filepath = os.path.join(source_dir, filenames[idx])
+        arr = np.load(filepath).astype(np.float32)
+        row = arr.shape[0] - 1
+        while row > 0:
+            arr[row, 0] -= arr[row-1, 0]
+            arr[row, 2] -= arr[row-1, 2]
+            row -= 1
+        arrays.append(arr)
+        idx += 1
+    return arrays
 
 
-def generate_continuation(
-    model: acLSTM,
-    seed_np: np.ndarray,
-    gen_len: int,
-    gt: int,
-    cond: int,
-    device: torch.device
-) -> np.ndarray:
-    """
-    Given seed_np (B, T, D), generate `gen_len` additional frames.
-    """
-    model.eval()
-    seq = torch.from_numpy(seed_np).to(device)
-    out, (h, c) = None, acLSTM.init_state(seq.size(0), device)
-    # feed all seed frames
-    with torch.no_grad():
-        for t in range(seq.size(1)):
-            out, (h, c) = model.forward_step(seq[:, t], (h, c))
-        # generate new frames
-        generated = []
-        for _ in range(gen_len):
-            out, (h, c) = model.forward_step(out, (h, c))
-            generated.append(out.cpu().numpy())
-    gen_np = np.stack(generated, axis=1)
-    return np.concatenate([seed_np, gen_np], axis=1)
+def export_bvh_euler_sequence(frames: np.ndarray, output_path: str):
+    data = frames.copy()
+    t = 0
+    last_x, last_z = 0.0, 0.0
+    total = data.shape[0]
+    while t < total:
+        data[t, 0] += last_x
+        last_x = data[t, 0]
+        data[t, 2] += last_z
+        last_z = data[t, 2]
+        t += 1
 
-# --- Output ---
-def write_to_bvh(sequence: np.ndarray, out_path: Path):
-    """
-    Reconstruct absolute translations, decode units, and write BVH.
-    """
-    data = sequence.copy()
-    last_x = last_z = 0.0
-    for t in range(data.shape[0]):
-        data[t,0] += last_x; last_x = data[t,0]
-        data[t,2] += last_z; last_z = data[t,2]
-    # undo encoding
-    data[:,:3] /= WEIGHT_TRANSLATION
-    data[:,3:] *= 180.0 / math.pi
+    data[:, :3] /= TRANSLATION_SCALE
+    data[:, 3:] *= ANGLE_SCALE
     data = np.round(data, 6)
     template = getattr(read_bvh, 'standard_bvh_file', 'train_data_bvh/standard.bvh')
-    read_bvh.write_frames(template, str(out_path), data)
+    read_bvh.write_frames(template, output_path, data)
 
-# --- Main Execution ---
-def main():
-    # Input paths
-    read_weight_path = "/Users/tooulas/Downloads/0011200final.weight"
-    dances_folder = Path("../train_data_euler/martial/")
-    write_folder = Path("./out_euler_new/")
 
-    # Parameters
-    dance_frame_rate = 60
-    batch_size = 5
-    seed_len = 15      # ground-truth frames
-    gen_frames = 400
-    cond = seed_len    # reuse seed_len as cond steps
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def synthesize_sequence(seed_seq: np.ndarray,
+                        num_generate: int,
+                        net: MotionLSTM,
+                        out_dir: str,
+                        dev):
+    batch_size, seed_len, feat_dim = seed_seq.shape
+    tensor_seq = torch.tensor(seed_seq, device=dev)
+    h_states, c_states = MotionLSTM.init_states(batch_size, dev)
 
-    # Load and prep data
-    os.makedirs(write_folder, exist_ok=True)
-    clips = load_and_diff_clips(dances_folder)
+    # Warm-up phase
+    index = 0
+    last_out = None
+    while index < seed_len:
+        last_out, (h_states, c_states) = net.step(tensor_seq[:, index], (h_states, c_states))
+        index += 1
 
-    # Prepare model
-    frame_dim = clips[0].shape[1]
-    model = acLSTM(frame_dim).to(device)
-    model.load_state_dict(torch.load(read_weight_path, map_location=device))
+    # Generation phase
+    generated = []
+    count = 0
+    while count < num_generate:
+        last_out, (h_states, c_states) = net.step(last_out, (h_states, c_states))
+        generated.append(last_out.detach().cpu().numpy())
+        count += 1
 
-    # Sample seeds and generate
-    seed_np = select_seeds(clips, batch_size, seed_len)
-    full_seq = generate_continuation(model, seed_np, gen_frames, gt=seed_len, cond=cond, device=device)
+    gen_arr = np.stack(generated, axis=1)
+    full_seq = np.concatenate([seed_seq, gen_arr], axis=1)
 
-    # Write outputs
-    for i, seq in enumerate(full_seq):
-        out_path = write_folder / f"euler_synth_out_{i:02d}.bvh"
-        write_to_bvh(seq, out_path)
-        print(f"Wrote {out_path}")
+    os.makedirs(out_dir, exist_ok=True)
+    i = 0
+    while i < batch_size:
+        filename = f"euler_synth_out_{i:02d}.bvh"
+        export_bvh_euler_sequence(full_seq[i], os.path.join(out_dir, filename))
+        i += 1
+
+    return full_seq
+
+
+def run_generation_pipeline(motion_list,
+                            rate: int,
+                            batch_count: int,
+                            seed_length: int,
+                            gen_length: int,
+                            weight_file: str,
+                            output_folder: str,
+                            dev):
+    feature_dim = motion_list[0].shape[1]
+    model = MotionLSTM(feature_dim).to(dev)
+    raw_state = torch.load(weight_file, map_location=dev)
+    mapped_state = {}
+    for key, val in raw_state.items():
+        if key.startswith('lstm1.'):
+            mapped_state['cell1.' + key[len('lstm1.'):]] = val
+        elif key.startswith('lstm2.'):
+            mapped_state['cell2.' + key[len('lstm2.'):]] = val
+        elif key.startswith('lstm3.'):
+            mapped_state['cell3.' + key[len('lstm3.'):]] = val
+        elif key.startswith('dec.') or key.startswith('decoder.'):
+            mapped_state['output_layer.' + key.split('.', 1)[1]] = val
+        else:
+            mapped_state[key] = val
+    model.load_state_dict(mapped_state)
+    model.eval()
+
+    # Prepare seeds
+    seeds = []
+    counter = 0
+    while counter < batch_count:
+        clip = random.choice(motion_list)
+        if clip.shape[0] < seed_length:
+            raise RuntimeError("Seed clip shorter than required length")
+        start_idx = random.randint(0, clip.shape[0] - seed_length)
+        seeds.append(clip[start_idx:start_idx + seed_length])
+        counter += 1
+
+    seeds_np = np.stack(seeds, axis=0)
+
+    # Generate and save
+    return synthesize_sequence(seeds_np,
+                               gen_length,
+                               model,
+                               output_folder,
+                               dev)
 
 if __name__ == "__main__":
-    main()
+    weights_path = "./output_weights_euler_martial/0011200final.weight"
+    weave_folder = "./out_euler_new/"
+    source_folder = "../train_data_euler/martial/"
+    os.makedirs(weave_folder, exist_ok=True)
+
+    dances_data = collect_motion_arrays(source_folder)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    result_sequences = run_generation_pipeline(
+        dances_data,
+        rate=60,
+        batch_count=5,
+        seed_length=15,
+        gen_length=400,
+        weight_file=weights_path,
+        output_folder=weave_folder,
+        dev=device
+    )
+    print(f"Generated synthesized .bvh files")
