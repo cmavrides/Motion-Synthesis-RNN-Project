@@ -1,101 +1,169 @@
-# euler_synthesize.py
+#!/usr/bin/env python3
+"""
+Euler-angle Motion Synthesis Refactored
+
+Loads encoded .npy clips, selects random seed segments,
+and generates continuation via an acLSTM model.
+Outputs synthesized BVH files.
+"""
 import os
+import math
+import random
+from pathlib import Path
+
 import numpy as np
 import torch
+import torch.nn as nn
+
 import read_bvh
 
-#— import your normalization constants & helpers from your generation script —
-from generate_training_euler_data import (
-    WEIGHT_TRANSLATION,
-    ANGLE_SCALE,
-    STANDARD_BVH_FILE,
-    EXPECTED_PARAMS,
-    _pad_or_truncate
-)
+# --- Constants ---
+HIDDEN_SIZE = 1024
+WEIGHT_TRANSLATION = 0.01
+HIP_INDEX = read_bvh.joint_index['hip']
 
-# import your trained model definition
-from pytorch_train_euler_aclstm import acLSTM
+# --- Model Definition ---
+class acLSTM(nn.Module):
+    def __init__(self, frame_dim: int, hidden: int = HIDDEN_SIZE):
+        super().__init__()
+        self.lstm1 = nn.LSTMCell(frame_dim, hidden)
+        self.lstm2 = nn.LSTMCell(hidden, hidden)
+        self.lstm3 = nn.LSTMCell(hidden, hidden)
+        self.dec = nn.Linear(hidden, frame_dim)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-Hip = read_bvh.joint_index['hip']
+    @staticmethod
+    def init_state(batch: int, device: torch.device):
+        h = [torch.zeros(batch, HIDDEN_SIZE, device=device) for _ in range(3)]
+        c = [torch.zeros(batch, HIDDEN_SIZE, device=device) for _ in range(3)]
+        return h, c
 
+    def forward_step(self, x: torch.Tensor, state):
+        h, c = state
+        h[0], c[0] = self.lstm1(x, (h[0], c[0]))
+        h[1], c[1] = self.lstm2(h[0], (h[1], c[1]))
+        h[2], c[2] = self.lstm3(h[1], (h[2], c[2]))
+        out = self.dec(h[2])
+        return out, (h, c)
 
-def generate_euler_seq(initial_seq_np, generate_frames, model, save_folder):
+    def forward(self, seq: torch.Tensor, *, gt: int, cond: int) -> torch.Tensor:
+        B, T, C = seq.shape
+        device = seq.device
+        pattern = torch.tensor(([1]*gt + [0]*cond) * ((T // (gt+cond)) + 1),
+                               device=device, dtype=torch.bool)[:T]
+        h, c = acLSTM.init_state(B, device)
+        xo = torch.zeros(B, C, device=device)
+        outputs = []
+        for t in range(T):
+            inp = seq[:, t] if pattern[t] else xo
+            xo, (h, c) = self.forward_step(inp, (h, c))
+            outputs.append(xo)
+        return torch.stack(outputs, dim=1)
+
+# --- Data Utilities ---
+def load_and_diff_clips(folder: Path) -> list[np.ndarray]:
     """
-    initial_seq_np: np.array, shape (B, L0, F)  — already normalized (trans*W, angles/A)
-    generate_frames: how many new frames to synthesize
-    model: acLSTM loaded with your weights
-    save_folder: where to write the .bvh outputs
+    Load .npy clips and apply hip X/Z frame differencing in-place.
     """
-    B, L0, F = initial_seq_np.shape
-    L = L0 + generate_frames
+    clips = []
+    for file in sorted(folder.glob('*.npy')):
+        arr = np.load(file).astype(np.float32)
+        # subtract previous frame hip x,z
+        arr[1:, 0] -= arr[:-1, 0]
+        arr[1:, 2] -= arr[:-1, 2]
+        clips.append(arr)
+    return clips
 
-    # — build the “teacher-forcing” input tensor —
-    # we need a full length L, but only first L0 steps are real:
-    full_np = np.zeros((B, L, F), dtype=np.float32)
-    # apply hip-diff on the initial L0 frames
-    dif = initial_seq_np[:, 1:] - initial_seq_np[:, :-1]
-    init_tf = initial_seq_np[:, :-1].copy()
-    init_tf[:, :, Hip*3    ] = dif[:, :, Hip*3    ]
-    init_tf[:, :, Hip*3 + 2] = dif[:, :, Hip*3 + 2]
-    full_np[:, :L0-1, :] = init_tf
-
-    inp = torch.from_numpy(full_np).to(device)
-    # forward: feed L0 ground-truth steps, then let it predict the rest
-    pred_flat = model.forward(
-        inp,
-        condition_num=generate_frames,
-        groundtruth_num=L0
-    )  # → (B, L*F) flattened
-    pred = pred_flat.view(B, L, F).detach().cpu().numpy()
-
-    #— stitch GT + generated
-    result = np.concatenate([initial_seq_np, pred[:, L0:, :]], axis=1)  # (B, L, F)
-
-    #— undo hip-diff and decode back to raw BVH channels —
-    def unroll_hip(arr):
-        last_x = last_z = 0.0
-        out = arr.copy()
-        for t in range(out.shape[0]):
-            out[t, Hip*3    ] += last_x
-            out[t, Hip*3 + 2] += last_z
-            last_x = out[t, Hip*3    ]
-            last_z = out[t, Hip*3 + 2]
-        return out
-
-    os.makedirs(save_folder, exist_ok=True)
-    for b in range(B):
-        seq_norm = unroll_hip(result[b])
-
-        trans_norm  = seq_norm[:, :3]
-        angles_norm = seq_norm[:, 3:]
-        trans  = trans_norm  / WEIGHT_TRANSLATION
-        angles = angles_norm * ANGLE_SCALE
-        raw    = np.concatenate([trans, angles], axis=1)
-        raw_fixed = _pad_or_truncate(raw, EXPECTED_PARAMS)
-
-        out_path = os.path.join(save_folder, f"out{b:02d}_euler.bvh")
-        read_bvh.write_frames(STANDARD_BVH_FILE, out_path, raw_fixed)
-        print(f"Wrote {out_path}  (frames={raw_fixed.shape[0]})")
-
-    return result
+# --- Synthesis Pipeline ---
+def select_seeds(clips: list[np.ndarray], batch: int, seed_len: int) -> np.ndarray:
+    """
+    Randomly sample batch of seed sequences of length `seed_len`.
+    """
+    seeds = []
+    for _ in range(batch):
+        clip = random.choice(clips)
+        if len(clip) < seed_len:
+            raise ValueError("Clip shorter than seed length")
+        start = random.randint(0, len(clip) - seed_len)
+        seeds.append(clip[start:start + seed_len])
+    return np.stack(seeds, axis=0)  # shape (B, seed_len, D)
 
 
+def generate_continuation(
+    model: acLSTM,
+    seed_np: np.ndarray,
+    gen_len: int,
+    gt: int,
+    cond: int,
+    device: torch.device
+) -> np.ndarray:
+    """
+    Given seed_np (B, T, D), generate `gen_len` additional frames.
+    """
+    model.eval()
+    seq = torch.from_numpy(seed_np).to(device)
+    out, (h, c) = None, acLSTM.init_state(seq.size(0), device)
+    # feed all seed frames
+    with torch.no_grad():
+        for t in range(seq.size(1)):
+            out, (h, c) = model.forward_step(seq[:, t], (h, c))
+        # generate new frames
+        generated = []
+        for _ in range(gen_len):
+            out, (h, c) = model.forward_step(out, (h, c))
+            generated.append(out.cpu().numpy())
+    gen_np = np.stack(generated, axis=1)
+    return np.concatenate([seed_np, gen_np], axis=1)
+
+# --- Output ---
+def write_to_bvh(sequence: np.ndarray, out_path: Path):
+    """
+    Reconstruct absolute translations, decode units, and write BVH.
+    """
+    data = sequence.copy()
+    last_x = last_z = 0.0
+    for t in range(data.shape[0]):
+        data[t,0] += last_x; last_x = data[t,0]
+        data[t,2] += last_z; last_z = data[t,2]
+    # undo encoding
+    data[:,:3] /= WEIGHT_TRANSLATION
+    data[:,3:] *= 180.0 / math.pi
+    data = np.round(data, 6)
+    template = getattr(read_bvh, 'standard_bvh_file', 'train_data_bvh/standard.bvh')
+    read_bvh.write_frames(template, str(out_path), data)
+
+# --- Main Execution ---
+def main():
+    # Input paths
+    read_weight_path = "/Users/tooulas/Downloads/0011200final.weight"
+    dances_folder = Path("../train_data_euler/martial/")
+    write_folder = Path("./out_euler_new/")
+
+    # Parameters
+    dance_frame_rate = 60
+    batch_size = 5
+    seed_len = 15      # ground-truth frames
+    gen_frames = 400
+    cond = seed_len    # reuse seed_len as cond steps
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Load and prep data
+    os.makedirs(write_folder, exist_ok=True)
+    clips = load_and_diff_clips(dances_folder)
+
+    # Prepare model
+    frame_dim = clips[0].shape[1]
+    model = acLSTM(frame_dim).to(device)
+    model.load_state_dict(torch.load(read_weight_path, map_location=device))
+
+    # Sample seeds and generate
+    seed_np = select_seeds(clips, batch_size, seed_len)
+    full_seq = generate_continuation(model, seed_np, gen_frames, gt=seed_len, cond=cond, device=device)
+
+    # Write outputs
+    for i, seq in enumerate(full_seq):
+        out_path = write_folder / f"euler_synth_out_{i:02d}.bvh"
+        write_to_bvh(seq, out_path)
+        print(f"Wrote {out_path}")
 
 if __name__ == "__main__":
-    # 1) load your model & weights
-    model = acLSTM(in_frame_size=171, hidden_size=1024, out_frame_size=171)
-    ckpt = torch.load("/Users/tooulas/Downloads/0000000.weight", map_location=device)
-    model.load_state_dict(ckpt)
-    model.to(device).eval()
-
-    # 2) prepare a small batch of initial sequences:
-    #    here we load from your numpy‐encoded Euler data
-    initial_folder = "../train_data_euler/martial/"
-    files = sorted(f for f in os.listdir(initial_folder) if f.endswith(".npy"))
-    batch_np = np.stack([np.load(initial_folder+f)[:15] for f in files[:5]])
-    #    ⇒ (B=5, L0=15, F=171)
-
-    # 3) run synthesis
-    out_dir = "./euler_out_bvh/"
-    generate_euler_seq(batch_np, generate_frames=400, model=model, save_folder=out_dir)
+    main()
