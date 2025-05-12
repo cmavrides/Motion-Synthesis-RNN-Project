@@ -1,95 +1,124 @@
 import read_bvh
-import read_bvh
 import numpy as np
-from os import listdir
-import os
-from scipy.spatial.transform import Rotation as R
-from read_bvh import joint_index
+from pathlib import Path
+import transforms3d.euler as euler
+import transforms3d.quaternions as quat
 
-# Load reference skeleton
-standard_bvh_file = "train_data_bvh/standard.bvh"
-skeleton, non_end_bones = read_bvh.read_bvh_hierarchy.read_bvh_hierarchy(standard_bvh_file)
+# Configuration and hierarchy load
+standard_bvh_file = Path("train_data_bvh/standard.bvh")
+weight_translation = 0.01
+skeleton, non_end_bones = read_bvh.read_bvh_hierarchy.read_bvh_hierarchy(str(standard_bvh_file))
+
+# Precompute channel layout and rotating joints
+motion_channels = [
+    (joint, ch)
+    for joint, bone in skeleton.items()
+    for ch in bone['channels']
+]
+joints_with_rot = [
+    joint
+    for joint, bone in skeleton.items()
+    if any('rotation' in c.lower() for c in bone['channels'])
+]
+
 
 def generate_quad_traindata_from_bvh(src_bvh_folder, tar_traindata_folder):
-    if not os.path.exists(tar_traindata_folder):
-        os.makedirs(tar_traindata_folder)
+    """
+    Reads raw BVH files, converts each frame’s 3 Euler rotation channels into quaternions
+    (plus scaled hip translation), and saves the result as .npy files.
+    """
+    src_path = Path(src_bvh_folder)
+    dst_path = Path(tar_traindata_folder)
+    dst_path.mkdir(parents=True, exist_ok=True)
 
-    for filename in os.listdir(src_bvh_folder):
-        if filename.endswith(".bvh"):
-            bvh_path = os.path.join(src_bvh_folder, filename)
-            train_data = read_bvh.get_train_data(bvh_path)  # shape: (frames, joints*3)
-            # Assume first 3 values are root translation, rest are Euler angles (in groups of 3)
-            quat_data = []
-            for frame in train_data:
-                root = frame[:3]
-                eulers = frame[3:].reshape(-1, 3)  # shape: (num_joints, 3)
-                # Convert each joint's Euler angles to quaternion (BVH is usually ZXY order)
-                quats = R.from_euler('zxy', eulers, degrees=True).as_quat()  # shape: (num_joints, 4)
-                # Store as [root, q1, q2, ...]
-                quat_frame = np.concatenate([root, quats.flatten()])
-                quat_data.append(quat_frame)
-            quat_data = np.array(quat_data)
-            out_path = os.path.join(tar_traindata_folder, filename.replace(".bvh", ".npy"))
-            np.save(out_path, quat_data)
-            print(f"Saved quaternion training data: {out_path}")
+    # Dimension of quaternion-encoded data: 3 hip + 4 per rotating joint
+    qdim = 3 + 4 * len(joints_with_rot)
+
+    for bvh_file in src_path.iterdir():
+        # skip anything that's not a single-suffix .bvh (avoid .bvh.bvh)
+        if bvh_file.suffix.lower() != '.bvh' or bvh_file.name.lower().endswith('.bvh.bvh'):
+            continue
+        if bvh_file.suffix.lower() != '.bvh':
+            continue
+        raw = read_bvh.parse_frames(str(bvh_file))  # shape [F, P]
+        F = raw.shape[0]
+
+        quad_data = np.zeros((F, qdim), dtype=np.float32)
+        for i, frame in enumerate(raw):
+            # Scale and record hip translation
+            row = list(frame[:3] * weight_translation)
+
+            # Convert Euler rotations to quaternions
+            for joint in joints_with_rot:
+                angles = [
+                    frame[motion_channels.index((joint, ch))]
+                    for ch in skeleton[joint]['channels']
+                    if 'rotation' in ch.lower()
+                ]
+                rad = [angle * np.pi / 180.0 for angle in angles]
+                q = euler.euler2quat(rad[0], rad[1], rad[2], axes='szxy')
+                row.extend(q)
+
+            quad_data[i] = row
+
+        out_file = dst_path / f"{bvh_file.stem}.npy"
+        np.save(str(out_file), quad_data)
+
+
 
 def generate_bvh_from_quad_traindata(src_train_folder, tar_bvh_folder):
-    if not os.path.exists(tar_bvh_folder):
-        os.makedirs(tar_bvh_folder)
+    """
+    Reads quaternion‐encoded .npy files, converts quaternions back to Euler angles + translations,
+    rebuilds the original BVH channel matrix, and writes .bvh files.
+    """
+    src_path = Path(src_train_folder)
+    dst_path = Path(tar_bvh_folder)
+    dst_path.mkdir(parents=True, exist_ok=True)
 
-    for filename in os.listdir(src_train_folder):
-        if filename.endswith(".npy"):
-            train_data_path = os.path.join(src_train_folder, filename)
-            quat_data = np.load(train_data_path)
-            # Convert quaternions back to Euler angles for BVH
-            euler_data = []
-            for frame in quat_data:
-                root = frame[:3]
-                quats = frame[3:].reshape(-1, 4)  # shape: (num_joints, 4)
-                # Convert each joint's quaternion to Euler angles (BVH is usually ZXY order)
-                eulers = R.from_quat(quats).as_euler('zxy', degrees=True)  # shape: (num_joints, 3)
-                euler_frame = np.concatenate([root, eulers.flatten()])
-                euler_data.append(euler_frame)
-            euler_data = np.array(euler_data)
-            bvh_out_path = os.path.join(tar_bvh_folder, filename.replace(".npy", ".bvh"))
-            read_bvh.write_traindata_to_bvh(bvh_out_path, euler_data)
-            print(f"Reconstructed BVH from quaternion data saved: {bvh_out_path}")
+    n_params = len(motion_channels)
 
-#bvh_dir_path = r"C:\Users\alexa\OneDrive - University of Cyprus\Masters in Artificial Intelligence\2nd semester\ML For Graphics - 645\FINAL PROJECT\MAI645_Team_04\train_data_bvh\indian"
-#quad_enc_dir_path = r"train_data_quad\indian"
-#bvh_reconstructed_dir_path = r"reconstructed_quad_bvh\indian"
+    for npy_file in src_path.iterdir():
+        # only process .bvh.npy files generated by our converter
+        if not npy_file.name.lower().endswith('.bvh.npy'):
+            continue
+        if npy_file.suffix.lower() != '.npy':
+            continue
+        arr = np.load(str(npy_file))  # shape [F, 3+4M]
+        F = arr.shape[0]
 
+        raw = np.zeros((F, n_params), dtype=np.float32)
+        for i, row in enumerate(arr):
+            # Undo hip scaling
+            raw[i, :3] = row[:3] / weight_translation
 
-#comment the following to run test_generate_data.py
-# Encode data from bvh to positional encoding
-#generate_quad_traindata_from_bvh(bvh_dir_path, quad_enc_dir_path)
+            offset = 3
+            for joint in joints_with_rot:
+                q = row[offset:offset + 4]
+                offset += 4
+                R = np.asarray(quat.quat2mat(q), dtype=np.float64)
+                rad = euler.mat2euler(R, axes='szxy')
+                degs = [r * 180.0 / np.pi for r in rad]
 
-# Decode from positional to bvh
-#generate_bvh_from_quad_traindata(quad_enc_dir_path, bvh_reconstructed_dir_path)
+                # Inject back into appropriate channels
+                for ch in skeleton[joint]['channels']:
+                    if 'rotation' in ch.lower():
+                        idx = motion_channels.index((joint, ch))
+                        raw[i, idx] = degs.pop(0)
 
+        out_bvh = dst_path / npy_file.name.replace('.npy', '.bvh')
+        read_bvh.write_frames(str(standard_bvh_file), str(out_bvh), raw)
 
-
-#bvh_dir_path = r"C:\Users\alexa\OneDrive - University of Cyprus\Masters in Artificial Intelligence\2nd semester\ML For Graphics - 645\FINAL PROJECT\MAI645_Team_04\train_data_bvh\salsa"
-#quad_enc_dir_path = r"train_data_quad\salsa"
-bvh_reconstructed_dir_path = r"reconstructed_quad_bvh\salsa"
-
-
-#comment the following to run test_generate_data.py
-# Encode data from bvh to positional encoding
-#generate_quad_traindata_from_bvh(bvh_dir_path, quad_enc_dir_path)
-
-# Decode from positional to bvh
-#generate_bvh_from_quad_traindata(quad_enc_dir_path, bvh_reconstructed_dir_path)
-
-
-bvh_dir_path = r"C:\Users\alexa\Desktop\MAI645_Team_04\train_data_bvh\martial"
-quad_enc_dir_path = r"train_data_quad\martial"
-bvh_reconstructed_dir_path = r"reconstructed_quad_bvh\martial"
+    # ——— Cleanup: remove any single-suffix .bvh files — keep only *.bvh.bvh
+    for f in dst_path.iterdir():
+        if f.suffix.lower() == '.bvh' and not f.name.lower().endswith('.bvh.bvh'):
+            f.unlink()
 
 
-#comment the following to run test_generate_data.py
-# Encode data from bvh to positional encoding
-generate_quad_traindata_from_bvh(bvh_dir_path, quad_enc_dir_path)
+if __name__ == "__main__":
+    # Example paths - replace with actual directories
+    bvh_dir_path = "./train_data_bvh/martial/"
+    quat_enc_dir_path = "./train_data_quad/martial/"
+    bvh_reconstructed_quad_dir = "./reconstructed_quad_bvh_new/martial/"
 
-# Decode from positional to bvh
-generate_bvh_from_quad_traindata(quad_enc_dir_path, bvh_reconstructed_dir_path)
+    generate_quad_traindata_from_bvh(bvh_dir_path, quat_enc_dir_path)
+    generate_bvh_from_quad_traindata(quat_enc_dir_path, bvh_reconstructed_quad_dir)
