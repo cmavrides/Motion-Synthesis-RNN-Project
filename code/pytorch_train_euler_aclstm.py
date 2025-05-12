@@ -109,7 +109,7 @@ def train_one_iteration(real_np: np.ndarray,
     seq_np = hip_differential(real_np, HIP_IDX)
 
     # 2) to torch
-    seq = torch.tensor(seq_np, dtype=torch.float32, device="cpu")
+    seq = torch.tensor(seq_np, dtype=torch.float32, device="cuda")
     inp = seq[:, :-1]      # feed up to T-1
     tgt = seq[:, 1:]       # predict 1..T
 
@@ -210,7 +210,7 @@ def main():
     STANDARD_BVH_FILE = args.template_bvh if args.template_bvh else STANDARD_BVH_FILE
 
     # build model
-    model = acLSTM(frame_dim=FEATURE_DIM)
+    model = acLSTM(frame_dim=FEATURE_DIM).cuda()
     if args.read_weight_path:
         model.load_state_dict(torch.load(args.read_weight_path))
     optim = torch.optim.Adam(model.parameters(), lr=1e-4)
