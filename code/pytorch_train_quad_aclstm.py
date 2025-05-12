@@ -121,102 +121,59 @@ class acLSTM(nn.Module):
         return hip_loss + quat_loss
 
 
-import torch
-import torch.nn.functional as F
-import numpy as np
-import tempfile
-from pathlib import Path
-from generate_training_quad_data import generate_bvh_from_quad_traindata
-
-def train_one_iteration(
-    real_seq_np: np.ndarray,
-    model: acLSTM,
-    optimizer: torch.optim.Optimizer,
-    iteration: int,
-    total_iterations: int,
-    save_dance_folder: Path,
-    print_loss: bool = False,
-    save_bvh_motion: bool = True
-) -> None:
+def train_one_iteration(real_seq_np: np.ndarray,
+                        model: acLSTM,
+                        optimizer: torch.optim.Optimizer,
+                        iteration: int,
+                        save_dance_folder: Path,
+                        print_loss: bool = False,
+                        save_bvh_motion: bool = True) -> None:
     """
-    One training step with scheduled sampling and a warm‐up period:
-      - real_seq_np: (B, seq_len+1, D) absolute (scaled hip+quats)
-      - seq_len+1 = 100+2 = 102 deltas → 101 inputs
+    Perform one training iteration: forward, backward, optionally save BVH output.
     """
-    # 1) Build Δ-hip inputs
+    # 1) Build input sequence with hip deltas
     dif = real_seq_np[:, 1:, :3] - real_seq_np[:, :-1, :3]
-    real_seq_diff = real_seq_np[:, :-1].copy()        # [B, 102, D]
+    real_seq_diff = real_seq_np[:, :-1].copy()
     real_seq_diff[:, :, 0] = dif[:, :, 0]
     real_seq_diff[:, :, 2] = dif[:, :, 2]
 
-    # 2) To tensors: inp=(B,101,D), gt_seq=(B,101,D)
+    # 2) Convert to tensors
     device = next(model.parameters()).device
-    inp    = torch.from_numpy(real_seq_diff[:, :-1]).float().to(device)
-    gt_seq = torch.from_numpy(real_seq_diff[:,  1: ]).float().to(device)
-    B, L, D = inp.shape
-    M = (D - 3) // 4
+    inp = torch.from_numpy(real_seq_diff[:, :-1]).float().to(device)
+    gt_flat = torch.from_numpy(
+        real_seq_diff[:, 1:].reshape(real_seq_np.shape[0], -1)
+    ).float().to(device)
 
-    # 3) Compute teacher-forcing ratio with warmup
-    warmup_iters = 10000
-    if iteration < warmup_iters:
-        teacher_ratio = 1.0
-    else:
-        teacher_ratio = max(
-            0.0,
-            1.0 - (iteration - warmup_iters) / float(total_iterations - warmup_iters)
-        )
-
-    # 4) Unroll LSTM with per-step sampling; always force t=0
-    h, c      = model.init_hidden(B, device)
-    out_frame = torch.zeros(B, D, device=device)
-    outputs   = []
-
-    for t in range(L):
-        if t == 0:
-            inp_t = inp[:, 0, :]
-        else:
-            mask = (torch.rand(B, device=device) < teacher_ratio).float().unsqueeze(1)
-            inp_t = mask * inp[:, t, :] + (1.0 - mask) * out_frame
-
-        raw, h, c = model.forward_lstm(inp_t, h, c)
-        hip   = raw[:, :3]
-        quats = raw[:, 3:].view(B, M, 4)
-        quats = F.normalize(quats, p=2, dim=-1, eps=1e-6)
-        out_frame = torch.cat([hip, quats.view(B, M*4)], dim=1)
-        outputs.append(out_frame.unsqueeze(1))
-
-    # 5) Flatten predictions & ground truth for loss
-    pred_flat = torch.cat(outputs, dim=1).reshape(B, -1)  # [B,101*D]
-    gt_flat   = gt_seq.reshape(B, -1)                    # [B,101*D]
-
-    # 6) Backprop
+    # 3) Forward + loss + backward
+    pred_flat = model(inp, Condition_num, Groundtruth_num)
     optimizer.zero_grad()
     loss = model.calculate_loss(pred_flat, gt_flat)
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     optimizer.step()
 
     if print_loss:
-        print(f"Iter {iteration:07d}  Loss={loss.item():.6f}")
+        print(f"Iter {iteration:07d}  Loss: {loss.item():.6f}")
 
-    # 7) Optional BVH snapshot
+    # 4) Optionally generate BVH from prediction
     if save_bvh_motion:
-        D0 = D
-        L0 = pred_flat.size(1) // D0
-        pred_enc = pred_flat[0].detach().cpu().numpy().reshape(L0, D0)
+        D = In_frame_size
+        L = pred_flat.size(1) // D
+        pred_enc = pred_flat[0].detach().cpu().numpy().reshape(L, D)
 
-        # integrate hip deltas → absolute
+        # integrate hip deltas back to absolute
         pred_enc[:, 0] = np.cumsum(pred_enc[:, 0])
         pred_enc[:, 2] = np.cumsum(pred_enc[:, 2])
 
+        # save to temp and reconstruct BVH
         with tempfile.TemporaryDirectory() as tmpdir:
-            tmp     = Path(tmpdir)
-            gt_npy  = tmp / f"{iteration:07d}_gt.bvh.npy"
+            tmp = Path(tmpdir)
+            # rename to .bvh.npy so reconstructor picks them up
+            gt_npy = tmp / f"{iteration:07d}_gt.bvh.npy"
             out_npy = tmp / f"{iteration:07d}_out.bvh.npy"
-            np.save(str(gt_npy), real_seq_np[0, 1:1+L0, :])
+            np.save(str(gt_npy), real_seq_np[0, 1:1+L, :])
             np.save(str(out_npy), pred_enc)
             generate_bvh_from_quad_traindata(str(tmp), str(save_dance_folder))
-
 
 
 def get_dance_length_list(dances: list[np.ndarray]) -> list[int]:
@@ -285,10 +242,8 @@ def train(dances: list[np.ndarray],
             torch.save(model.state_dict(), str(ckpt))
 
         train_one_iteration(batch_np, model, optimizer,
-                    iteration, total_iter,
-                    write_bvh_motion_folder,
-                    print_loss, save_bvh)
-
+                            iteration, write_bvh_motion_folder,
+                            print_loss, save_bvh)
 
 
 def main():
