@@ -17,10 +17,10 @@ def generate_euler_traindata_from_bvh(
     tar_traindata_folder: str
 ) -> None:
     """
-    Encode every *.bvh in `src_bvh_folder` as a normalized NumPy array (F×C):
+    Encode  *.bvh of one dance as a normalized NumPy array (F×C):
       • root translation [m] → scaled by TRANSLATION_SCALE
       • Euler angles [deg] → radians
-    Saves each as *.npy in `tar_traindata_folder`.
+    Saves each as *.npy in `train_data_euler`.
     """
     process_motion_data(
         source=src_bvh_folder,
